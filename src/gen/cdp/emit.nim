@@ -286,53 +286,63 @@ proc emitCommand(ctx: EmitCtx; cmd: PdlCommand): string =
   if cmd.doc.len > 0:
     result.add renderDoc(cmd.doc, 2)
 
-  # Wrap the params-building, send, and decode in a single block so
-  # any `Exception` from `toJson`/`jsonTo` (which jsonutils' inferred
-  # raises let through) becomes a `CDPError`. Without this, the proc's
-  # async raises whitelist would be violated.
+  # The marshal calls (`toJson`, `jsonTo`) are wrapped in
+  # ``{.cast(raises: [CatchableError]).}:`` because their inferred
+  # raises set transitively contains the bare ``system.Exception``
+  # type, which is a sibling of ``CatchableError`` (not a subtype) —
+  # so a plain ``except CatchableError`` does not satisfy the strict
+  # raises check on the async proc. The cast erases the inferred set
+  # at that point, leaving only what we re-raise from inside it (a
+  # CatchableError subtype if jsonutils raises one). The cast is also
+  # gcsafe-effect-clearing, so we don't need a separate gcsafe cast.
+  # See `/tmp/nim-raises-research.md` (and citations therein) for the
+  # full story; tl;dr: jsonutils has no explicit `raises:` pragma.
   if cmd.parameters.len == 0:
-    result.add "  let raw = await client.sendCommand(\"" &
-               domainName & "." & pName & "\")\n"
     if retType == "void":
-      result.add "  discard raw\n"
+      result.add "  let raw {.used.} = await client.sendCommand(\"" &
+                 domainName & "." & pName & "\")\n"
     else:
+      result.add "  let raw = await client.sendCommand(\"" &
+                 domainName & "." & pName & "\")\n"
       result.add "  try:\n"
       result.add "    {.cast(gcsafe).}:\n"
-      result.add "      result = jsonTo(raw, " & retType & ")\n"
-      result.add "  except CDPError as e: raise e\n"
-      result.add "  except CDPTransportError as e: raise e\n"
-      result.add "  except CancelledError as e: raise e\n"
+      result.add "      {.cast(raises: [CatchableError]).}:\n"
+      result.add "        result = jsonTo(raw, " & retType & ")\n"
       result.add "  except CatchableError as e:\n"
       result.add "    raise newException(CDPError,\n"
       result.add "      \"" & domainName & "." & pName &
                  ": malformed response: \" & e.msg)\n"
   else:
-    result.add "  var raw: JsonNode\n"
+    result.add "  let params = newJObject()\n"
     result.add "  try:\n"
-    result.add "    let params = newJObject()\n"
     result.add "    {.cast(gcsafe).}:\n"
+    result.add "      {.cast(raises: [CatchableError]).}:\n"
     for p in cmd.parameters:
       let f = mangleField(p.name)
       let access = if f.needsBackticks: "`" & f.nim & "`" else: f.nim
       if p.optional:
-        result.add "      if " & access & ".isSome:\n"
-        result.add "        params[\"" & p.name & "\"] = toJson(" & access & ".get)\n"
+        result.add "        if " & access & ".isSome:\n"
+        result.add "          params[\"" & p.name & "\"] = toJson(" & access & ".get)\n"
       else:
-        result.add "      params[\"" & p.name & "\"] = toJson(" & access & ")\n"
-    result.add "    raw = await client.sendCommand(\"" &
-               domainName & "." & pName & "\", params)\n"
-    if retType != "void":
-      result.add "    {.cast(gcsafe).}:\n"
-      result.add "      result = jsonTo(raw, " & retType & ")\n"
-    result.add "  except CDPError as e: raise e\n"
-    result.add "  except CDPTransportError as e: raise e\n"
-    result.add "  except CancelledError as e: raise e\n"
+        result.add "        params[\"" & p.name & "\"] = toJson(" & access & ")\n"
     result.add "  except CatchableError as e:\n"
     result.add "    raise newException(CDPError,\n"
     result.add "      \"" & domainName & "." & pName &
-               ": marshal failed: \" & e.msg)\n"
+               ": encode failed: \" & e.msg)\n"
     if retType == "void":
-      result.add "  discard raw\n"
+      result.add "  let raw {.used.} = await client.sendCommand(\"" &
+                 domainName & "." & pName & "\", params)\n"
+    else:
+      result.add "  let raw = await client.sendCommand(\"" &
+                 domainName & "." & pName & "\", params)\n"
+      result.add "  try:\n"
+      result.add "    {.cast(gcsafe).}:\n"
+      result.add "      {.cast(raises: [CatchableError]).}:\n"
+      result.add "        result = jsonTo(raw, " & retType & ")\n"
+      result.add "  except CatchableError as e:\n"
+      result.add "    raise newException(CDPError,\n"
+      result.add "      \"" & domainName & "." & pName &
+                 ": malformed response: \" & e.msg)\n"
   result.add "\n"
 
 # --------------------------------------------------------- events ---------
@@ -361,15 +371,17 @@ proc emitEventRegistration(ctx: EmitCtx; ev: PdlEvent): string =
     result.add renderDoc(ev.doc, 2)
   result.add "  client.addEventListener(\"" & domainName & "." & ev.name &
              "\", proc(params: JsonNode) {.gcsafe, raises: [].} =\n"
-  # `jsonTo` is transitively GC-unsafe because the JsonNode tree owns
-  # heap state that the compiler can't prove is single-threaded. The
-  # cast is sound here because the transport invokes listeners only on
-  # its own dispatcher thread.
+  # The marshal call sits inside ``cast(raises: [])`` so the inferred
+  # ``Exception`` from jsonutils doesn't escape the listener's
+  # ``raises: []`` contract. The local try/except converts any actual
+  # decode failure into a silent drop — listener callbacks must not
+  # raise out into the transport's dispatch loop.
+  result.add "    var typed: " & paramsType & "\n"
   result.add "    {.cast(gcsafe).}:\n"
-  result.add "      var typed: " & paramsType & "\n"
-  result.add "      try: typed = jsonTo(params, " & paramsType & ")\n"
-  result.add "      except Exception: return\n"
-  result.add "      cb(typed))\n\n"
+  result.add "      {.cast(raises: []).}:\n"
+  result.add "        try: typed = jsonTo(params, " & paramsType & ")\n"
+  result.add "        except CatchableError: return\n"
+  result.add "    cb(typed))\n\n"
 
 # --------------------------------------------------------- module --------
 

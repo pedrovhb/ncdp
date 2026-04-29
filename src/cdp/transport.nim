@@ -55,14 +55,26 @@ proc allocId(c: CDPClient): int =
   c.nextId
 
 proc failPending(c: CDPClient; reason: string) =
-  ## Fail every still-pending request with a ``CDPTransportError``. Called
-  ## when the session closes or when the receive loop hits an
-  ## unrecoverable decode failure.
+  ## Fail every still-pending request with a ``CDPTransportError``.
+  ## Does NOT set ``c.closed`` — used both on permanent shutdown
+  ## paths (caller sets ``closed`` first) and on transient per-frame
+  ## errors that fail the in-flight batch but keep the session.
   for id, fut in c.pending.mpairs:
     if not fut.finished:
       let e = newException(CDPTransportError, reason)
       fut.fail(e)
   c.pending.clear()
+
+proc markClosed(c: CDPClient; reason: string) =
+  ## Idempotent transition into the closed state. Logs once and
+  ## fails any in-flight requests. Safe to call from any of the
+  ## paths that observe shutdown: explicit `close`, `WSEventKind.Closed`
+  ## from chrome's side, or `onRunnerDone` when the receive loop
+  ## ends without a Closed event.
+  if c.closed: return
+  c.closed = true
+  info "transport closed", reason = reason
+  c.failPending(reason)
 
 proc dispatchResponse*(c: CDPClient; frame: JsonNode) {.raises: [].} =
   ## Inbound frame carries an ``id`` — match it to a pending Future and
@@ -138,8 +150,7 @@ proc onEvent(ws: WSClient; ev: WSEvent;
     discard
   of WSEventKind.Closed:
     trace "frame received", kind = "closed", code = int(ev.code)
-    c.closed = true
-    c.failPending("transport closed: " & $int(ev.code) & " " & ev.reason)
+    c.markClosed("transport closed: " & $int(ev.code) & " " & ev.reason)
 
 # --------------------------------------------------------- test helpers ---
 
@@ -166,9 +177,8 @@ proc onRunnerDone*(udata: pointer) {.gcsafe, raises: [].} =
   ## annotation, in which case we still need to flush pending Futures
   ## so callers don't hang on them forever.
   let client = cast[CDPClient](udata)
-  if client.isNil or client.closed: return
-  client.closed = true
-  client.failPending("receive loop ended without Closed event")
+  if client.isNil: return
+  client.markClosed("receive loop ended without Closed event")
 
 proc connect*(url: string): Future[CDPClient] {.
     async: (raises: [CDPTransportError, CancelledError]).} =
@@ -268,12 +278,10 @@ proc close*(c: CDPClient): Future[void] {.async: (raises: [CancelledError]).} =
   ## Close the websocket and fail any still-pending requests. Safe to
   ## call multiple times; idempotent.
   if c.closed: return
-  c.closed = true
   await c.ws.close()
   if not c.runner.isNil and not c.runner.finished:
     try:
       await c.runner
     except CatchableError:
       discard
-  c.failPending("client closed by caller")
-  info "transport closed"
+  c.markClosed("client closed by caller")
