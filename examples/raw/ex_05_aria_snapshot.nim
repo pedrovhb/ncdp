@@ -6,10 +6,10 @@
 ##
 ## Usage::
 ##
-##   nim c -d:ssl -r examples/gen/ex_05_aria_snapshot.nim
-##   nim c -d:ssl -r examples/gen/ex_05_aria_snapshot.nim -- --url=https://example.com
-##   nim c -d:ssl -r examples/gen/ex_05_aria_snapshot.nim -- --discover --depth=3 --boxes
-##   nim c -d:ssl -r examples/gen/ex_05_aria_snapshot.nim -- --interactive
+##   nim c -d:ssl -r examples/raw/ex_05_aria_snapshot.nim
+##   nim c -d:ssl -r examples/raw/ex_05_aria_snapshot.nim -- --url=https://example.com
+##   nim c -d:ssl -r examples/raw/ex_05_aria_snapshot.nim -- --discover --depth=3 --boxes
+##   nim c -d:ssl -r examples/raw/ex_05_aria_snapshot.nim -- --interactive
 ##
 ## Set ``LD_LIBRARY_PATH=/run/current-system/sw/share/nix-ld/lib`` on
 ## NixOS if OpenSSL does not load.
@@ -91,6 +91,7 @@ proc parseArgs(): Args =
     case p.kind
     of cmdEnd: break
     of cmdShortOption, cmdLongOption:
+      if p.key.len == 0: continue # separator from ``nim c -r file -- ...``
       case p.key
       of "discover", "d": result.mode = mDiscover
       of "launch", "l":   result.mode = mLaunch

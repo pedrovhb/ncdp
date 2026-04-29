@@ -18,7 +18,7 @@ export json, jsonutils, options
 
 const cdpDecodeOpts* = Joptions(
   allowExtraKeys: true,    ## Chrome adds fields without protocol bumps.
-  allowMissingKeys: true)  ## Optional/Option[T] fields commonly absent.
+  allowMissingKeys: true)  ## Optional fields commonly absent.
   ## Default `Joptions` for inbound JSON decoding of CDP responses.
   ## Both flags are necessary in practice: Chrome ships fields we
   ## don't know yet without updating the protocol version, and

@@ -11,7 +11,7 @@ header**, not from the actual listening port. chronos's
 so Chrome answers with `ws://127.0.0.1/devtools/browser/...` — the port is
 gone, and the subsequent websocket connect hits a 308 redirect.
 
-**Why:** observed end-to-end while wiring `examples/gen/ex_02`. Verified
+**Why:** observed end-to-end while wiring `examples/raw/ex_02`. Verified
 with curl: `-H "Host: 127.0.0.1"` reproduces the port-stripping;
 `-H "Host: 127.0.0.1:9222"` returns the correct URL. So this is Chrome's
 behaviour, not a chronos bug, and it affects any HTTP client that omits

@@ -3,8 +3,8 @@
 ##
 ## Run with::
 ##
-##   nim c -r examples/gen/ex_01_parse_summary.nim
-##   nim c -r examples/gen/ex_01_parse_summary.nim resources/devtools-protocol/pdl/domains/Memory.pdl
+##   nim c -r examples/raw/ex_01_parse_summary.nim
+##   nim c -r examples/raw/ex_01_parse_summary.nim resources/devtools-protocol/pdl/domains/Memory.pdl
 ##
 ## With no argument the example loads ``js_protocol.pdl`` from the bundled
 ## ``resources/`` tree, so it works out of the box from a fresh checkout.

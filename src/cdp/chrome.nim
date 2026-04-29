@@ -26,6 +26,17 @@ logScope:
   topics = "chrome"
 
 type
+  ChromeOutputCapture = ref object
+    text: string
+
+  ChromeOutputMode* = enum
+    ## What to do with Chrome's own stdout/stderr when launched by ncdp.
+    ## ``coDiscard`` keeps examples quiet while draining pipes so Chrome
+    ## cannot block. ``coInherit`` leaves output attached to the parent
+    ## process. ``coBuffer`` captures output and exposes it after process
+    ## termination via ``chromeOutput``.
+    coDiscard, coInherit, coBuffer
+
   LaunchOptions* = object
     ## Configuration knobs for `launch`. Sensible defaults mean the
     ## common case — "give me a headless Chrome on a random local
@@ -47,10 +58,14 @@ type
     bootTimeout*: Duration
       ## How long `launch` waits for the debugger endpoint to come up
       ## before giving up. Default 10 seconds.
+    chromeOutput*: ChromeOutputMode
+      ## Default ``coDiscard``. Controls Chrome stdout/stderr handling.
 
   ChromeProcess* = ref object
     handle: AsyncProcessRef
+    outputMode: ChromeOutputMode
     outputDrainer: Future[void]
+    outputCapture: ChromeOutputCapture
     wsUrl*: string
       ## Browser-level websocket URL (the ``webSocketDebuggerUrl`` from
       ## ``/json/version``). Pass this straight to
@@ -60,6 +75,11 @@ type
       ## ``/json/`` for tab discovery, etc.
     userDataDir: string
       ## Set when launch created a temp dir; cleaned up on terminate.
+
+  ChromeTab* = object
+    ## Target information returned by Chrome's ``/json/new`` endpoint.
+    id*: string
+    wsUrl*: string
 
   ChromeError* = object of CatchableError
     ## Any failure from this module: missing binary, boot timeout,
@@ -111,7 +131,13 @@ proc initLaunchOptions*(): LaunchOptions =
     host: "127.0.0.1",
     port: 9222,
     headless: true,
-    bootTimeout: 10.seconds)
+    bootTimeout: 10.seconds,
+    chromeOutput: coDiscard)
+
+proc chromeOutput*(p: ChromeProcess): string =
+  ## Captured Chrome stdout/stderr when launched with ``coBuffer``.
+  ## Returns completed output after ``terminate`` or boot-failure cleanup.
+  if p.outputCapture.isNil: "" else: p.outputCapture.text
 
 # -------------------------------------------------------- helpers -----------
 
@@ -185,19 +211,50 @@ proc buildArgs(opts: LaunchOptions; userDataDir: string): seq[string] =
   for a in opts.extraArgs: result.add a
   result.add "about:blank"
 
-proc drainChromeOutput(p: AsyncProcessRef): Future[void] {.
+proc drainChromeOutput(p: AsyncProcessRef; keep: bool;
+                       capture: ChromeOutputCapture): Future[void] {.
     async: (raises: [CancelledError]).} =
   ## Chrome writes unrelated diagnostics to stdout/stderr, including some
   ## before its logging flags take effect. Capture and drain the stream so
-  ## examples stay quiet and Chrome cannot block on a full pipe. The bytes
-  ## are intentionally discarded for now; this keeps a single place to add
-  ## opt-in surfacing later.
+  ## examples stay quiet and Chrome cannot block on a full pipe. When
+  ## ``keep`` is true, keep the captured bytes for ``chromeOutput``.
   try:
-    discard await p.stdoutStream.read()
+    while true:
+      let chunk = await p.stdoutStream.read(8192)
+      if chunk.len == 0: break
+      if keep:
+        for b in chunk: capture.text.add char(b)
   except CancelledError as e:
     raise e
   except CatchableError:
     discard
+
+proc finishChromeOutput(drainer: Future[void]): Future[void] {.
+    async: (raises: [CancelledError]).} =
+  ## Finish the output drainer after ``AsyncProcessRef.closeWait`` has closed
+  ## the process streams. If the drainer is still parked in a read despite
+  ## that, cancel it rather than guessing at an EOF timeout.
+  if drainer.isNil: return
+  try:
+    if drainer.finished:
+      await drainer
+    else:
+      await drainer.cancelAndWait()
+  except CancelledError:
+    discard
+  except CatchableError:
+    discard
+
+proc closeChromeProcess(process: AsyncProcessRef;
+                        drainer: Future[void]): Future[void] {.
+    async: (raises: [CancelledError]).} =
+  ## Close chronos's process handles and streams, then finish the output
+  ## drainer. The ordering matters: ``closeWait`` deterministically closes the
+  ## local stdout reader/transport, so cleanup does not depend on descendants
+  ## closing their copy of the pipe at any particular time.
+  try: await process.closeWait()
+  except CatchableError: discard
+  await finishChromeOutput(drainer)
 
 proc fetchVersion(host: string; port: int): Future[JsonNode] {.
     async: (raises: [ChromeError, CancelledError]).} =
@@ -313,21 +370,34 @@ proc fetchWithMethod(host: string; port: int; path: string;
   except CatchableError as e:
     raise newException(ChromeError, &"{path}: bad JSON: " & e.msg)
 
-proc newTab*(host: string; port: int;
-              url = "about:blank"): Future[string] {.
+proc newTabPathForTest*(url: string): string =
+  ## Test hook for the REST endpoint path used by ``newTab``.
+  "/json/new?" & encodeUrl(url)
+
+proc newTabInfo*(host: string; port: int;
+                 url = "about:blank"): Future[ChromeTab] {.
     async: (raises: [ChromeError, CancelledError]).} =
   ## Open a new browser tab via Chrome's `PUT /json/new?<url>` REST
-  ## convenience endpoint and return its `webSocketDebuggerUrl`. The
+  ## convenience endpoint and return its target id plus page websocket. The
   ## endpoint creates an honest target (a separate page-scoped
   ## websocket) so a CDPClient connected to the returned URL can
   ## issue `Page.*`, `Runtime.*`, `DOM.*` etc. without needing
   ## session routing on top of the browser-level websocket.
-  let info = await fetchWithMethod(host, port, "/json/new?" & encodeUrl(url),
-                                   MethodPut)
+  let info = await fetchWithMethod(host, port, newTabPathForTest(url), MethodPut)
+  let id = info.getOrDefault("id")
+  if id.isNil or id.kind != JString:
+    fail("/json/new: missing id")
   let wsUrl = info.getOrDefault("webSocketDebuggerUrl")
   if wsUrl.isNil or wsUrl.kind != JString:
     fail("/json/new: missing webSocketDebuggerUrl")
-  rewriteAuthority(wsUrl.getStr(), host, port)
+  result = ChromeTab(id: id.getStr(),
+                     wsUrl: rewriteAuthority(wsUrl.getStr(), host, port))
+
+proc newTab*(host: string; port: int;
+              url = "about:blank"): Future[string] {.
+    async: (raises: [ChromeError, CancelledError]).} =
+  ## Open a new browser tab and return its page-scoped websocket URL.
+  result = (await newTabInfo(host, port, url)).wsUrl
 
 proc closeTab*(host: string; port: int; targetId: string):
     Future[void] {.async: (raises: [ChromeError, CancelledError]).} =
@@ -361,11 +431,18 @@ proc launch*(opts = initLaunchOptions()): Future[ChromeProcess] {.
   # rather than just the parent — without it we routinely returned
   # from ``terminate`` while a renderer still held the user-data dir
   # open, causing ``removeDir`` to silently fail.
+  let captureOutput = opts.chromeOutput != coInherit
+  let processOptions =
+    if captureOutput:
+      {AsyncProcessOption.ProcessGroup, AsyncProcessOption.StdErrToStdOut}
+    else:
+      {AsyncProcessOption.ProcessGroup}
+  let stdoutHandle =
+    if captureOutput: AsyncProcess.Pipe else: ProcessStreamHandle()
   let process = try:
       await startProcess(exe, arguments = args,
-                         options = {AsyncProcessOption.ProcessGroup,
-                                    AsyncProcessOption.StdErrToStdOut},
-                         stdoutHandle = AsyncProcess.Pipe)
+                         options = processOptions,
+                         stdoutHandle = stdoutHandle)
     except CancelledError as e:
       if createdDataDir:
         try: removeDir(dataDir)
@@ -376,12 +453,19 @@ proc launch*(opts = initLaunchOptions()): Future[ChromeProcess] {.
         try: removeDir(dataDir)
         except CatchableError: discard
       raise newException(ChromeError, "startProcess failed: " & e.msg)
-  let outputDrainer = drainChromeOutput(process)
-  asyncSpawn outputDrainer
+  let outputCapture = ChromeOutputCapture()
+  let outputDrainer =
+    if captureOutput:
+      drainChromeOutput(process, opts.chromeOutput == coBuffer, outputCapture)
+    else: nil
+  if not outputDrainer.isNil:
+    asyncSpawn outputDrainer
 
   result = ChromeProcess(
     handle: process,
+    outputMode: opts.chromeOutput,
     outputDrainer: outputDrainer,
+    outputCapture: outputCapture,
     httpBase: &"http://{opts.host}:{opts.port}",
     userDataDir: if createdDataDir: dataDir else: "",
   )
@@ -391,11 +475,7 @@ proc launch*(opts = initLaunchOptions()): Future[ChromeProcess] {.
     # Boot failed — tear the process down before propagating.
     try: discard process.terminate()
     except CatchableError: discard
-    try: await process.closeWait()
-    except CatchableError: discard
-    if not outputDrainer.finished:
-      try: await outputDrainer.cancelAndWait()
-      except CatchableError: discard
+    await closeChromeProcess(process, outputDrainer)
     unregisterLiveProcess(result)
     if result.userDataDir.len > 0:
       try: removeDir(result.userDataDir)
@@ -460,12 +540,7 @@ proc terminate*(p: ChromeProcess; grace = 3.seconds): Future[void] {.
     raise e
   except CatchableError: discard
 
-  try: await p.handle.closeWait()
-  except CatchableError: discard
-
-  if not p.outputDrainer.isNil and not p.outputDrainer.finished:
-    try: await p.outputDrainer.cancelAndWait()
-    except CatchableError: discard
+  await closeChromeProcess(p.handle, p.outputDrainer)
 
   unregisterLiveProcess(p)
 

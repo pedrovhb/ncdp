@@ -55,10 +55,15 @@ directory and link it from `MEMORY.md`. Every memory file has frontmatter
 
 ## Building & running
 
-* `nimble test` — parser, transport, name-mangling, codegen, and
-  generated-corpus compile tests.
+* `nimble test` — parser, transport, name-mangling, codegen, and focused
+  generated-output checks. The full generated-corpus `nim check` is opt-in
+  via `-d:ncdpFullCompileCheck` because it is slow.
 * `nimble gen` — regenerate ignored bindings under `src/cdp/gen/`.
-* `nim c -d:ssl -r examples/gen/ex_02_call_browser_getVersion.nim` —
+* `nimble docs` — generate local API docs under ignored `htmldocs/`.
+  It intentionally skips `cdp/chrome.nim` and high-level modules that import
+  it because Nim doc trips over Chronos `asyncproc` on this toolchain.
+* `nimble examples` — compile the numbered examples without running Chrome.
+* `nim c -d:ssl -r examples/ex_01_browser_get_version.nim` —
   end-to-end smoke against a launched Chrome. Needs
   `LD_LIBRARY_PATH=/run/current-system/sw/share/nix-ld/lib` at runtime
   (see memory note).

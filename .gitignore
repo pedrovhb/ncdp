@@ -1,24 +1,35 @@
 # Build artifacts
 nimcache/
+htmldocs/
 *.exe
 *.o
 *.so
 *.dylib
 
 # Built example binaries (no extension on Linux/macOS).
+examples/ex_01_browser_get_version
+examples/ex_02_page_goto_eval_screenshot
+examples/ex_03_aria_snapshot
 examples/gen/ex_01_parse_summary
 examples/gen/ex_02_call_browser_getVersion
 examples/gen/ex_02_call_schema_getDomains
+examples/gen/ex_03_browser_via_codegen
+examples/gen/ex_04_navigate_eval_screenshot
+examples/gen/ex_05_aria_snapshot
+examples/raw/ex_01_parse_summary
+examples/raw/ex_02_call_browser_getVersion
+examples/raw/ex_03_browser_via_codegen
+examples/raw/ex_04_navigate_eval_screenshot
+examples/raw/ex_05_aria_snapshot
 
 # Built test binaries
 tests/tpdl_parser
+tests/tchrome
 tests/ttransport
 tests/tnames
 tests/tnames_corpus
 tests/temit
 tests/temit_compile
 src/gen/cdp/driver
+src/cdp/chrome
 src/cdp/gen/
-examples/gen/ex_03_browser_via_codegen
-examples/gen/ex_04_navigate_eval_screenshot
-examples/gen/ex_05_aria_snapshot

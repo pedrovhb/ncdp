@@ -24,14 +24,18 @@ domain bindings.
   - `chrome.nim` — process launcher (`launch`/`discover`/`terminate`).
   - `gen/` — ignored generated output: shared `types.nim` plus one
     command/event module per CDP domain.
+* `src/ncdp/` — high-level ergonomic browser automation layer. `browser.nim`
+  owns Browser/Page lifecycle, navigation, evaluation, and screenshots;
+  `aria.nim` wraps the bundled ARIA snapshot helper and ref actions.
 * `src/gen/cdp/` — codegen pipeline (`names.nim`, `emit.nim`, `driver.nim`).
   It reads parsed PDL, emits the shared type module, and emits per-domain
   command/event modules.
-* `examples/gen/` — `ex_01_parse_summary` (parser tour),
-  `ex_02_call_browser_getVersion` (live Chrome roundtrip),
-  `ex_03_browser_via_codegen` (generated Browser/Target bindings),
-  `ex_04_navigate_eval_screenshot` (page navigation/eval/screenshot),
-  and `ex_05_aria_snapshot` (Playwright-style ARIA tree and interactive refs).
+* `examples/` — top-level numbered examples are the recommended high-level
+  path: `ex_01_browser_get_version`, `ex_02_page_goto_eval_screenshot`, and
+  `ex_03_aria_snapshot`.
+* `examples/raw/` — numbered raw generated-CDP examples kept as reference
+  specimens: parser tour, direct Browser.getVersion, generated Browser/Target,
+  raw page navigation/eval/screenshot, and raw ARIA snapshot.
 * `tests/` — parser corpus tests, transport/jsonhook tests, name-mangling
   tests, emitter shape tests, and generated-corpus compile acceptance.
 * `resources/devtools-protocol/pdl/` — vendored CDP grammar files

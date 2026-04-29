@@ -10,7 +10,6 @@ switch("mm", "orc")
 
 # Strict-by-default style: keep warnings loud during development.
 switch("warning", "UnusedImport:on")
-switch("hint", "Processing:off")
 
 # chronicles: structured logging. Sink is plain text to stderr (keeps stdout
 # clean for example output). Log level is DEBUG in dev builds, INFO in
@@ -21,3 +20,13 @@ when defined(release):
 else:
   # switch("define", "chronicles_log_level=DEBUG")
   switch("define", "chronicles_log_level=WARN")
+
+# Keep routine compiler chatter out of normal runs; warnings and errors still
+# surface, but config/link/success noise does not.
+switch("hint", "[Conf]:off")
+switch("hint", "[Path]:off")
+switch("hint", "[CC]:off")
+switch("hint", "[Processing]:off")
+switch("hint", "[Link]:off")
+switch("hint", "[SuccessX]:off")
+switch("hint", "[Exec]:off")

@@ -9,10 +9,10 @@
 ## Usage::
 ##
 ##   # Spawn a fresh headless Chrome ourselves (no args at all):
-##   nim c -d:ssl -r examples/gen/ex_02_call_browser_getVersion.nim
+##   nim c -d:ssl -r examples/raw/ex_02_call_browser_getVersion.nim
 ##
 ##   # Use an already-running browser:
-##   nim c -d:ssl -r examples/gen/ex_02_call_browser_getVersion.nim -- --discover
+##   nim c -d:ssl -r examples/raw/ex_02_call_browser_getVersion.nim -- --discover
 ##
 ##   # Override host/port, in either mode:
 ##   ... -- --port 9333
@@ -41,6 +41,7 @@ proc parseArgs(): Args =
     case p.kind
     of cmdEnd: break
     of cmdShortOption, cmdLongOption:
+      if p.key.len == 0: continue # separator from ``nim c -r file -- ...``
       case p.key
       of "discover", "d": result.mode = mDiscover
       of "launch", "l": result.mode = mLaunch
