@@ -65,31 +65,17 @@ suite "module file names":
     check moduleFileName("SystemInfo") == "system_info"
     check moduleFileName("IO") == "io"
 
-suite "enum prefix and members":
+suite "enum members":
 
-  test "multi-word types use first letter of each word":
-    check enumPrefix("SubsamplingFormat") == "sf"
-    check enumPrefix("ImageType") == "it"
-    check enumPrefix("ResourcePriority") == "rp"
-    check enumPrefix("GPUDevice") == "gd"
-
-  test "single-word types use first two letters":
-    check enumPrefix("Color") == "co"
-    check enumPrefix("Type") == "ty"
-
-  test "enum member name":
-    check enumMemberName("SubsamplingFormat", "yuv420") == "sfYuv420"
-    check enumMemberName("ImageType", "jpeg") == "itJpeg"
-    check enumMemberName("InitiatorType", "console-api") == "itConsoleApi"
-    check enumMemberName("ResourceType", "Document") == "rtDocument"
-
-  test "is stable under repeat application":
-    # Calling twice with the already-mangled wire spelling should
-    # produce the same result up to the prefix swap. The codegen
-    # never does this, but a stable function is easier to reason
-    # about during refactors.
-    let once = enumMemberName("SubsamplingFormat", "yuv420")
-    check once == "sfYuv420"
+  test "wire spellings become Pascal-cased members":
+    # Pure enums (see emit.nim) mean members live under
+    # `Type.Member`, so the bare wire spelling is enough — no need
+    # for a per-type prefix.
+    check enumMemberName("SubsamplingFormat", "yuv420") == "Yuv420"
+    check enumMemberName("ImageType", "jpeg") == "Jpeg"
+    check enumMemberName("InitiatorType", "console-api") == "ConsoleApi"
+    check enumMemberName("ResourceType", "Document") == "Document"
+    check enumMemberName("AnyType", "auto_subframe") == "AutoSubframe"
 
 suite "field mangling":
 
@@ -132,13 +118,13 @@ suite "registry round-trip":
   test "recordEnum stores mapping":
     let reg = newRegistry()
     reg.recordEnum("SubsamplingFormat", [
-      ("sfYuv420", "yuv420"),
-      ("sfYuv422", "yuv422"),
-      ("sfYuv444", "yuv444"),
+      ("Yuv420", "yuv420"),
+      ("Yuv422", "yuv422"),
+      ("Yuv444", "yuv444"),
     ])
     check reg.enums.hasKey("SubsamplingFormat")
     check reg.enums["SubsamplingFormat"].members.len == 3
-    check reg.enums["SubsamplingFormat"].members[0] == ("sfYuv420", "yuv420")
+    check reg.enums["SubsamplingFormat"].members[0] == ("Yuv420", "yuv420")
 
   test "recordEnum raises on Nim-aliasing members":
     # `xAutoBookmark` and `xAuto_Bookmark` are the same Nim identifier

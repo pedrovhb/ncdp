@@ -1,29 +1,23 @@
-## ex_02_call_browser_getVersion — open a CDP connection and call
-## `Browser.getVersion`. The end-to-end smoke test for the runtime.
+## ex_03_browser_via_codegen — drives a real chrome through the
+## **codegen-produced** bindings under ``src/cdp/gen/``. End-to-end
+## proof that the generator's output works against a live browser.
 ##
-## (`Schema.getDomains` would have been an even smaller demo, but it
-## lives at page-target scope, and the debugger endpoint chrome opens
-## for us is browser-scope. `Browser.getVersion` is the canonical
-## "ping" that needs no setup.)
+## Calls a few different commands to exercise the various code paths
+## (no-params, optional params, complex result type).
 ##
 ## Usage::
 ##
-##   # Spawn a fresh headless Chrome ourselves (no args at all):
-##   nim c -d:ssl -r examples/gen/ex_02_call_browser_getVersion.nim
+##   nim c -d:ssl -r examples/gen/ex_03_browser_via_codegen.nim
+##   nim c -d:ssl -r examples/gen/ex_03_browser_via_codegen.nim -- --discover
 ##
-##   # Use an already-running browser:
-##   nim c -d:ssl -r examples/gen/ex_02_call_browser_getVersion.nim -- --discover
-##
-##   # Override host/port, in either mode:
-##   ... -- --port 9333
-##   ... -- --discover --host 127.0.0.1 --port 9222
-##
-## Set ``NCDP_CHROME=/path/to/chrome`` if your binary isn't on PATH.
+## Set ``LD_LIBRARY_PATH=/run/current-system/sw/share/nix-ld/lib`` if
+## OpenSSL doesn't load on NixOS.
 
-import std/[parseopt, strformat, strutils]
+import std/[options, parseopt, strformat, strutils]
 import chronos
 import cdp/[chrome, transport]
-import cdp/gen/browser
+import cdp/gen/browser as genBrowser
+import cdp/gen/target as genTarget
 
 type
   Mode = enum mLaunch, mDiscover
@@ -47,25 +41,32 @@ proc parseArgs(): Args =
       of "host": result.host = p.val
       of "port": result.port = parseInt(p.val)
       of "help", "h":
-        echo "usage: ex_02 [--launch|--discover] [--host=H] [--port=N]"
+        echo "usage: ex_03 [--launch|--discover] [--host=H] [--port=N]"
         quit 0
       else: quit "unknown option: --" & p.key
     of cmdArgument: quit "unexpected positional: " & p.key
 
-proc printVersion(client: CDPClient) {.async: (raises: [CatchableError]).} =
-  let v = await client.getVersion()
+proc demo(client: CDPClient) {.async: (raises: [CatchableError]).} =
+  echo "--- Browser.getVersion (no params, complex result) ---"
+  let v = await genBrowser.getVersion(client)
   echo &"  product:         {v.product}"
   echo &"  revision:        {v.revision}"
   echo &"  protocolVersion: {v.protocolVersion}"
   echo &"  jsVersion:       {v.jsVersion}"
-  echo &"  userAgent:       {v.userAgent}"
+
+  echo "--- Target.getTargets (optional param, list result) ---"
+  let targets = await genTarget.getTargets(
+    client, filter = none(TargetTargetFilter))
+  echo &"  {targets.targetInfos.len} target(s):"
+  for t in targets.targetInfos:
+    echo &"    [{t.`type`}] {t.title} — {t.url}"
 
 proc runDiscover(args: Args) {.async: (raises: [CatchableError]).} =
   let url = await chrome.discover(args.host, args.port)
   echo "discovered: ", url
   let client = await transport.connect(url)
   try:
-    await printVersion(client)
+    await demo(client)
   finally:
     await transport.close(client)
 
@@ -78,7 +79,7 @@ proc runLaunch(args: Args) {.async: (raises: [CatchableError]).} =
   try:
     let client = await transport.connect(cp.wsUrl)
     try:
-      await printVersion(client)
+      await demo(client)
     finally:
       await transport.close(client)
   finally:

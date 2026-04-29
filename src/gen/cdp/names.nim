@@ -180,52 +180,46 @@ proc toSnake*(s: string): string =
 
 proc moduleFileName*(domain: string): string =
   ## Domain `DOMSnapshot` → file basename `dom_snapshot` (no `.nim`).
-  toSnake(domain)
+  ## If the snake-cased name would be a Nim keyword (CDP has a
+  ## `Cast` domain → `cast`), append ``_domain`` to disambiguate;
+  ## Nim's ``import`` statement parses module names as identifiers
+  ## and won't accept backticked or keyword names.
+  result = toSnake(domain)
+  if isNimKeyword(result):
+    result &= "_domain"
 
 proc typeName*(domain, name: string): string =
-  ## PDL type name passes through as Nim type name. Domain qualifier
-  ## is unused in the same-domain case but kept here for symmetry —
-  ## cross-domain refs are emitted as `otherDomain.TypeName` directly
-  ## by the emitter, not by a global rename.
+  ## Globally-unique Nim type name for a PDL type. Because every
+  ## generated type lives in a single shared `gen/types.nim` module
+  ## (the only way to break PDL's cross-domain type cycles in Nim's
+  ## flat module-import model), names must be unique across the
+  ## corpus — PDL has duplicate type names across domains
+  ## (Network.RequestId vs Fetch.RequestId, etc.).
   ##
-  ## We do force a non-empty result; PDL guarantees uppercase-first
-  ## type names but a defensive capFirst guards against future drift.
-  capFirst(name)
+  ## So: prefix the bare PDL name with the (Pascal-cased) domain name.
+  ## ``Network.RequestId`` → ``NetworkRequestId``;
+  ## ``DOMSnapshot.NodeId`` → ``DomSnapshotNodeId``.
+  toPascal(domain) & capFirst(name)
 
 # ---------------------------------------------------------- enum prefix ---
 
-proc enumPrefix*(typeName: string): string =
-  ## A 2-3 letter lowercase abbreviation derived from a type name.
-  ## Used to namespace enum members so two enums can share a wire
-  ## spelling without colliding in Nim's flat enum-member namespace.
-  ##
-  ## Strategy: take the first letter of each word in `typeName`,
-  ## lowercase, capped at 3. If the type is one-word and short, fall
-  ## back to the first 2 letters lowercased.
-  ##
-  ## * `SubsamplingFormat` → `sf`
-  ## * `ImageType`         → `it`
-  ## * `ResourcePriority`  → `rp`
-  ## * `Color`             → `co`
-  ## * `GPUDevice`         → `gd`
-  let parts = splitWireWord(typeName)
-  if parts.len >= 2:
-    var p = ""
-    for i in 0 ..< min(parts.len, 3):
-      if parts[i].len > 0: p.add parts[i][0]
-    return p
-  if parts.len == 1 and parts[0].len >= 2:
-    return parts[0][0..1]
-  if parts.len == 1 and parts[0].len == 1:
-    return parts[0]
-  "x"
-
 proc enumMemberName*(typeName, wireMember: string): string =
-  ## `(SubsamplingFormat, "yuv420")` → `sfYuv420`.
-  ## `(ResourceType, "Document")` → `rtDocument`.
-  ## `(InitiatorType, "console-api")` → `itConsoleApi`.
-  let pre = enumPrefix(typeName)
-  pre & toPascal(wireMember)
+  ## With pure enums (see `pragmas` in emit.nim), members are
+  ## accessed as ``Type.member`` and do not pollute the module's
+  ## flat namespace. We can therefore use the bare wire spelling,
+  ## Pascal-cased, and rely on Nim's qualification rules for
+  ## disambiguation.
+  ##
+  ## * `(SubsamplingFormat, "yuv420")`  → ``Yuv420``
+  ## * `(ResourceType, "Document")`     → ``Document``
+  ## * `(InitiatorType, "console-api")` → ``ConsoleApi``
+  ##
+  ## ``typeName`` is unused now but kept in the signature so the
+  ## call sites stay readable and so future schemes (e.g. handling
+  ## a `_` numeric prefix for enum members starting with digits)
+  ## can use the type for context.
+  discard typeName
+  toPascal(wireMember)
 
 # ---------------------------------------------------------- fields --------
 
@@ -237,13 +231,44 @@ type
       ## declaration AND access sites.
 
 proc mangleField*(wireName: string): FieldName =
-  ## Field / parameter mangling. CDP wire spelling is already
+  ## Field mangling for object members. CDP wire spelling is already
   ## camelCase; we pass through, but flag Nim keywords so the emitter
   ## can wrap with backticks. We deliberately do NOT prefix or rename
   ## keyword fields — the wire name has to round-trip through JSON,
   ## and `json.toJson` uses the (backticked) field name verbatim.
   result.nim = wireName
   result.needsBackticks = isNimKeyword(wireName)
+
+type
+  ParamName* = object
+    ## Result of `mangleParam`. ``nim`` is the identifier to use in
+    ## the proc signature and any local references. ``wire`` is the
+    ## original PDL name to use as the JSON key. Most of the time
+    ## these are equal; they diverge for parameters that would
+    ## shadow `result` (the implicit async return) or that are Nim
+    ## keywords.
+    nim*: string
+    wire*: string
+    needsBackticks*: bool
+
+proc mangleParam*(wireName: string): ParamName =
+  ## Like `mangleField` but for command **parameters**. Adds two
+  ## extra rules on top of the field rules:
+  ##
+  ## 1. A parameter literally named ``result`` shadows the implicit
+  ##    async return that chronos's macro injects into every async
+  ##    proc — even void ones. Backticks don't save us; the symbol
+  ##    is always shadowed. Rename to ``resultArg``. The JSON wire
+  ##    key keeps the original spelling.
+  ## 2. Otherwise, treat as a field: pass through, backtick if
+  ##    keyword.
+  result.wire = wireName
+  if wireName == "result":
+    result.nim = "resultArg"
+    result.needsBackticks = false
+  else:
+    result.nim = wireName
+    result.needsBackticks = isNimKeyword(wireName)
 
 # ---------------------------------------------------------- wire map ------
 
@@ -265,16 +290,19 @@ proc newRegistry*(): NameRegistry =
 
 type
   EnumCollisionError* = object of CatchableError
-    ## Raised by `recordEnum` when two member spellings normalize to
-    ## the same Nim identifier. Indicates a name-mangling rule that
-    ## must be revised before codegen can emit this enum.
+    ## Raised by `recordEnum` when two members of the SAME enum
+    ## normalize to the same Nim identifier — Nim would reject the
+    ## type with a redefinition error (see
+    ## `/references/Nim/tests/enum/tredefinition.nim`).
+    ## Cross-enum collisions are NOT a problem because generated
+    ## enums are emitted as `{.pure.}` — members live under
+    ## `EnumType.Member`, not the flat module namespace.
 
 proc recordEnum*(reg: NameRegistry; typeName: string;
                  members: openArray[(string, string)]) =
-  ## Adds (or replaces) the wire-mapping entry for `typeName`. Raises
-  ## `EnumCollisionError` if any two Nim member names alias under
-  ## Nim's identifier-equality rules — that would silently fuse them
-  ## in the emitted enum.
+  ## Adds the wire-mapping entry for `typeName`. Raises
+  ## `EnumCollisionError` if any two members within this one enum
+  ## alias under Nim's identifier rules.
   var em = EnumWireMap(typeName: typeName)
   for m in members: em.members.add m
   for i in 0 ..< em.members.len:

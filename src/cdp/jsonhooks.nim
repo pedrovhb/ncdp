@@ -16,6 +16,15 @@
 import std/[base64, json, jsonutils, options, tables]
 export json, jsonutils, options
 
+const cdpDecodeOpts* = Joptions(
+  allowExtraKeys: true,    ## Chrome adds fields without protocol bumps.
+  allowMissingKeys: true)  ## Optional/Option[T] fields commonly absent.
+  ## Default `Joptions` for inbound JSON decoding of CDP responses.
+  ## Both flags are necessary in practice: Chrome ships fields we
+  ## don't know yet without updating the protocol version, and
+  ## omits any field whose value is "default" (including `Option`s
+  ## that the wire wouldn't see at all when `none`).
+
 type
   Binary* = distinct seq[byte]
     ## PDL `binary` field. Wire form: a base64-encoded string. In Nim

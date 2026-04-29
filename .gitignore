@@ -19,3 +19,4 @@ tests/temit
 tests/temit_compile
 src/gen/cdp/driver
 src/cdp/gen/
+examples/gen/ex_03_browser_via_codegen

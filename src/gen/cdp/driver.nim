@@ -15,10 +15,12 @@ import std/[algorithm, os, sets, strutils, tables]
 import ../pdl/[ast, parser]
 import ./[emit, names]
 
-const ReservedDomains = ["Schema", "SystemInfo"]
-  ## Hand-written reference modules at ``src/cdp/<name>.nim`` that the
-  ## emitter is supposed to reproduce. Re-emitting would clobber the
-  ## reference; acceptance tests diff against them instead.
+const ReservedDomains: array[0, string] = []
+  ## Domains the driver should NOT emit. Empty: every CDP domain is
+  ## generated. Earlier versions reserved Schema and SystemInfo as
+  ## hand-written reference fixtures the emitter had to reproduce;
+  ## now that the emitter is mature and the corpus compiles cleanly,
+  ## those references have been deleted.
 
 type
   GenOptions* = object
@@ -95,13 +97,32 @@ proc generate*(opts: GenOptions): GenReport =
     s
 
   if not opts.dryRun: createDir(opts.outDir)
+
+  # Pass 1: shared types module. Every PDL type from every generated
+  # domain lives here so cross-domain references resolve in Nim's
+  # flat module-import model.
+  let typesPath = opts.outDir / "types.nim"
+  var emitDomains: seq[PdlDomain]
+  for d in domains:
+    if isReserved(d.name): continue
+    if only.len > 0 and d.name notin only: continue
+    emitDomains.add d
+  let typesText = emitTypesModule(emitDomains, registry)
+  if opts.dryRun:
+    result.unchanged.add typesPath
+  elif writeIfChanged(typesPath, typesText):
+    result.written.add typesPath
+  else:
+    result.unchanged.add typesPath
+
+  # Pass 2: per-domain command+event modules.
   for d in domains:
     let path = opts.outDir / (moduleFileName(d.name) & ".nim")
     if isReserved(d.name) or
        (only.len > 0 and d.name notin only):
       result.skipped.add path
       continue
-    let text = emitDomain(d, registry)
+    let text = emitDomainModule(d, registry)
     if opts.dryRun:
       result.unchanged.add path
       continue

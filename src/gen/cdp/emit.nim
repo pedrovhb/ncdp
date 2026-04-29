@@ -1,62 +1,69 @@
-## Render a parsed PDL domain into the source text of a Nim module.
+## Render parsed PDL into the source text of Nim modules.
 ##
-## We render to **strings**, not to NimNode trees. NimNode + ``repr`` is
-## a great fit for compile-time macros where the output is consumed by
-## the compiler immediately, but it's a poor fit for "produce a file a
-## human will read" — ``repr`` doesn't preserve doc-comment placement,
-## blank-line grouping, or comment alignment, all of which matter for
-## the hand-written reference modules we're supposed to match
-## byte-for-byte.
+## ## Architecture: shared types + per-domain commands
 ##
-## The shape we target is the one nailed down by `src/cdp/schema.nim`
-## and `src/cdp/system_info.nim`. See the doc comments at the top of
-## each for the conventions.
+## CDP's PDL has cross-domain type cycles (Network ↔ Page, DOM ↔ Page,
+## etc.) that Nim's strict-acyclic module-import model can't represent
+## as separate modules. We collapse the entire type graph into one
+## module — ``src/cdp/gen/types.nim`` — where Nim's intra-module
+## forward references work naturally. Per-domain modules then carry
+## just the commands and event registrations and ``import ./types``.
 ##
-## ## Type mapping
+## To stay collision-free in the flat namespace, every generated
+## type name is **prefixed with its PDL domain**:
+## ``Network.RequestId`` → ``NetworkRequestId``,
+## ``DOMSnapshot.NodeIndex`` → ``DomSnapshotNodeIndex``. PDL has
+## several duplicate type names across domains (RequestId, CallFrame,
+## DialogType, ...) which the prefix disambiguates.
 ##
-## | PDL                         | Nim                              |
-## |-----------------------------|----------------------------------|
-## | ``string``                  | ``string``                       |
-## | ``integer``                 | ``int``                          |
-## | ``number``                  | ``float``                        |
-## | ``boolean``                 | ``bool``                         |
-## | ``any``                     | ``JsonNode``                     |
-## | ``binary``                  | ``Binary``                       |
-## | ``object`` (no type)        | ``JsonNode``                     |
-## | ``array of T``              | ``seq[T]``                       |
-## | ``Domain.Name`` (qualified) | ``domain.Name`` (cross-module)   |
-## | ``Name`` (unqualified)      | ``Name``                         |
-## | optional ``T``              | ``Option[T]``                    |
-##
-## ## Module layout produced
+## ## Output shape
 ##
 ## ```
-## ## <doc header>
+## # gen/types.nim
+## ## Generated types — every PDL type from every generated domain.
 ## import chronos
 ## import std/[json, jsonutils, options]
-## import ./jsonhooks
-## import ./transport
-## import ./<other-domain>   # only if the domain refs another domain's types
+## import ../jsonhooks
 ##
 ## type
-##   <enums (top-level + lifted-from-inline)>
-##   <objects + aliases>
-##   <command result types>
-##   <event params types>
+##   <every enum, prefixed with its domain>
+##   <every object, alias, *Result, *Params>
 ##
 ## const
-##   <one wire-mapping array per enum>
+##   <one wire array per enum>
 ##
-## <to/fromJsonHook overload pair per enum>
+## <to/fromJsonHook for each enum>
+## ```
+##
+## ```
+## # gen/<domain>.nim
+## ## Generated bindings for the CDP `<Domain>` domain.
+## import chronos
+## import std/[json, jsonutils, options]
+## import ../transport
+## import ./types
 ##
 ## <one proc per command>
 ## <one on<Event> registration proc per event>
 ## ```
 ##
-## Cross-domain refs are collected during emission and prepended to
-## the import block.
+## ## PDL → Nim type mapping
+##
+## | PDL                         | Nim                           |
+## |-----------------------------|-------------------------------|
+## | ``string``                  | ``string``                    |
+## | ``integer``                 | ``int``                       |
+## | ``number``                  | ``float``                     |
+## | ``boolean``                 | ``bool``                      |
+## | ``any``                     | ``JsonNode``                  |
+## | ``binary``                  | ``Binary`` (from jsonhooks)   |
+## | ``object`` (no type)        | ``JsonNode``                  |
+## | ``array of T``              | ``seq[T]``                    |
+## | ``Domain.Name``             | ``DomainName`` (prefixed)     |
+## | ``Name`` (same domain)      | ``DomainName`` (prefixed)     |
+## | optional ``T``              | ``Option[T]``                 |
 
-import std/[algorithm, options, sets, strutils]
+import std/[options, sets, strutils]
 import ../pdl/ast
 import ./names
 
@@ -65,23 +72,24 @@ import ./names
 type
   EnumBlock = object
     ## Three rendered chunks for one enum: the `Name* = enum ...` lines
-    ## (no leading `type` keyword), the `const NameWire: array[...]` block,
-    ## and the `to/fromJsonHook` proc pair. Kept separate because they
-    ## need to land in different sections of the output module.
+    ## (no leading `type` keyword), the `const NameWire: array[...]` body
+    ## row, and the `to/fromJsonHook` proc pair. Kept separate because
+    ## they need to land in different sections of the output module.
     nimType: string
     typeDecl: string
     wireConst: string
     hooks: string
 
   EmitCtx = ref object
-    ## Per-domain emission state. Tracks cross-domain references so
-    ## the import block at the top of the module can be derived.
+    ## Per-domain emission state used while walking PDL types and
+    ## producing the corresponding Nim. The ``registry`` is shared
+    ## across the whole types-module emission so enum collision
+    ## detection and wire-mapping bookkeeping work corpus-wide.
     domain: PdlDomain
-    imports: HashSet[string]    # domain *file* basenames to import
     registry: NameRegistry
-    lifted: seq[EnumBlock]      # synthetic enums lifted from inline PDL enums
+    lifted: seq[EnumBlock]
     liftedNames: HashSet[string]
-    inlineEnumOwner: string     # set by callers of emitType to name a lift target
+    inlineEnumOwner: string
 
 # --------------------------------------------------------- helpers --------
 
@@ -91,19 +99,37 @@ proc renderDoc(doc: seq[string]; indentN: int): string =
   for line in doc:
     result.add pad & "## " & line & "\n"
 
-proc pragmas(experimental, deprecated: bool;
-             extras: openArray[string] = []): string =
-  ## Renders a Nim pragma list. Only `deprecated` is a real pragma —
-  ## PDL's `experimental` flag is informational metadata, not a Nim
-  ## language feature, so it doesn't appear here. (Could be surfaced
-  ## as a doc-comment line in the future.)
+proc pragmas(deprecated: bool; extras: openArray[string] = []): string =
+  ## PDL's ``experimental`` is informational, not a Nim language
+  ## feature, so it isn't emitted. ``deprecated`` is a real Nim
+  ## pragma and is honored.
   var parts: seq[string]
   if deprecated: parts.add "deprecated"
   for e in extras: parts.add e
   if parts.len == 0: return ""
   " {." & parts.join(", ") & ".}"
 
-# --------------------------------------------------------- type rendering -
+# --------------------------------------------------------- type mapping ---
+
+const HandWrittenDomains*: array[0, string] = []
+  ## Empty after the codegen pipeline matured. No domain currently
+  ## has a hand-written counterpart; everything is generated.
+
+proc isHandWritten(name: string): bool =
+  for h in HandWrittenDomains:
+    if h == name: return true
+  false
+
+proc resultTypeName*(domain, cmd: string): string =
+  ## ``getInfo`` in domain ``SystemInfo`` → ``SystemInfoGetInfoResult``.
+  ## (Mostly used by command-emitter and result-emitter so they agree.)
+  toPascal(domain) & toPascal(cmd) & "Result"
+
+proc eventParamsTypeName*(domain, ev: string): string =
+  ## ``frameAttached`` in ``Page`` → ``PageFrameAttachedParams``.
+  toPascal(domain) & toPascal(ev) & "Params"
+
+proc emitType(ctx: EmitCtx; t: PdlType): string
 
 proc emitPrimitive(t: PdlPrimitiveType): string =
   case t.kind
@@ -115,33 +141,42 @@ proc emitPrimitive(t: PdlPrimitiveType): string =
   of ppBinary:  "Binary"
   of ppObject:  "JsonNode"
 
-const HandWrittenDomains* = ["Schema", "SystemInfo"]
-  ## Domains whose modules live at `src/cdp/<domain>.nim` rather than
-  ## the generated `src/cdp/gen/<domain>.nim`. Cross-domain refs to
-  ## these resolve one directory up.
-
-proc isHandWritten(name: string): bool =
-  for h in HandWrittenDomains:
-    if h == name: return true
-  false
-
 proc emitRef(ctx: EmitCtx; t: PdlRefType): string =
-  if t.domain.isSome and t.domain.get != ctx.domain.name:
-    let other = t.domain.get
-    let path = if isHandWritten(other): "../" & moduleFileName(other)
-               else: "./" & moduleFileName(other)
-    ctx.imports.incl path
-    return moduleFileName(other) & "." & typeName(other, t.name)
-  typeName(ctx.domain.name, t.name)
+  ## Resolve a (possibly cross-domain) PDL type reference to its
+  ## generated Nim name. The shared types module means every
+  ## reference is just a bare name — no module-qualifier path —
+  ## thanks to the domain prefix.
+  let dom = if t.domain.isSome: t.domain.get else: ctx.domain.name
+  if isHandWritten(dom):
+    raise newException(ValueError,
+      "generated code references hand-written domain " & dom &
+      " — not currently supported. Add an import in emitRef.")
+  typeName(dom, t.name)
+
+proc emitArray(ctx: EmitCtx; t: PdlArrayType): string =
+  "seq[" & ctx.emitType(t.element) & "]"
 
 proc renderEnumBlock(nimType: string;
                      members: seq[PdlEnumMember];
                      pairs: seq[(string, string)];
-                     experimental, deprecated: bool;
+                     deprecated: bool;
                      doc: seq[string]): EnumBlock =
+  ## Emits the enum as `{.pure.}` so members live under
+  ## ``TypeName.Member`` rather than the module's flat namespace.
+  ## Without `.pure.`, two CDP enums with shared member spellings
+  ## (e.g. SmartCardEmulation's `Disposition` and `ResultCode` both
+  ## have `reset-card`) would collide in the shared types module.
+  ## See `/references/Nim/doc/manual.md:1318` on `pure`.
   result.nimType = nimType
-  result.typeDecl = "  " & nimType & "*" & pragmas(experimental, deprecated) &
-                    " = enum\n"
+  let extras =
+    if deprecated: @["pure"] else: @["pure"]
+  # Manually compose the pragma; `pragmas()` doesn't take a list of
+  # always-on pragmas. Order: deprecated first if present, then pure.
+  var pragParts: seq[string]
+  if deprecated: pragParts.add "deprecated"
+  pragParts.add "pure"
+  let pragStr = " {." & pragParts.join(", ") & ".}"
+  result.typeDecl = "  " & nimType & "*" & pragStr & " = enum\n"
   if doc.len > 0:
     result.typeDecl.add renderDoc(doc, 4)
   for i, m in members:
@@ -171,21 +206,18 @@ proc renderEnumBlock(nimType: string;
 
 proc registerEnum(ctx: EmitCtx; nimType: string;
                   members: seq[PdlEnumMember];
-                  experimental, deprecated: bool;
+                  deprecated: bool;
                   doc: seq[string]): EnumBlock =
   var pairs: seq[(string, string)]
   for m in members:
     pairs.add (enumMemberName(nimType, m.name), m.name)
   ctx.registry.recordEnum(nimType, pairs)
-  renderEnumBlock(nimType, members, pairs, experimental, deprecated, doc)
-
-proc emitType(ctx: EmitCtx; t: PdlType): string
+  renderEnumBlock(nimType, members, pairs, deprecated, doc)
 
 proc liftInlineEnum(ctx: EmitCtx; t: PdlEnumType): string =
-  ## Lift an anonymous PDL enum to a synthetic named type. Caller
-  ## must have set ``ctx.inlineEnumOwner`` to the desired Nim type
-  ## name (Pascal-cased, e.g. ``GoMode``). Idempotent — repeated lifts
-  ## with the same name reuse the prior emission.
+  ## Anonymous PDL enum at a property/parameter site → synthetic named
+  ## type ``<Owner><Field>``. ``ctx.inlineEnumOwner`` carries the
+  ## already-domain-prefixed Pascal name from the caller.
   let nimType = ctx.inlineEnumOwner
   if nimType.len == 0:
     raise newException(ValueError,
@@ -193,13 +225,9 @@ proc liftInlineEnum(ctx: EmitCtx; t: PdlEnumType): string =
   if nimType notin ctx.liftedNames:
     ctx.liftedNames.incl nimType
     let blk = registerEnum(ctx, nimType, t.members,
-                            experimental = false, deprecated = false,
-                            doc = @[])
+                            deprecated = false, doc = @[])
     ctx.lifted.add blk
   nimType
-
-proc emitArray(ctx: EmitCtx; t: PdlArrayType): string =
-  "seq[" & ctx.emitType(t.element) & "]"
 
 proc emitType(ctx: EmitCtx; t: PdlType): string =
   if t of PdlPrimitiveType: emitPrimitive(PdlPrimitiveType(t))
@@ -211,14 +239,13 @@ proc emitType(ctx: EmitCtx; t: PdlType): string =
 
 # --------------------------------------------------------- objects --------
 
-proc emitProperty(ctx: EmitCtx; p: PdlProperty; ownerPrefix: string): string =
-  ## One field line in an object body, with its trailing doc lines.
-  ## ``ownerPrefix`` names the enclosing type (Pascal-cased) so that
-  ## any inline enum on this property can be lifted to a synthetic
-  ## type ``<owner><Field>``.
+proc emitProperty(ctx: EmitCtx; p: PdlProperty; ownerNimType: string): string =
+  ## One field line. ``ownerNimType`` is the (already domain-prefixed)
+  ## Nim name of the enclosing object, used to derive the lift target
+  ## for any inline enum on this field.
   let f = mangleField(p.name)
   let nm = if f.needsBackticks: "`" & f.nim & "`" else: f.nim
-  ctx.inlineEnumOwner = ownerPrefix & toPascal(p.name)
+  ctx.inlineEnumOwner = ownerNimType & toPascal(p.name)
   var typStr = ctx.emitType(p.typ)
   ctx.inlineEnumOwner = ""
   if p.optional: typStr = "Option[" & typStr & "]"
@@ -229,8 +256,7 @@ proc emitProperty(ctx: EmitCtx; p: PdlProperty; ownerPrefix: string): string =
 proc emitObject(ctx: EmitCtx; o: PdlObjectDecl): string =
   let nimType = typeName(ctx.domain.name, o.name)
   let dep = o.deprecated or ctx.domain.deprecated
-  let exp = o.experimental or ctx.domain.experimental
-  result = "  " & nimType & "*" & pragmas(exp, dep) & " = ref object\n"
+  result = "  " & nimType & "*" & pragmas(dep) & " = ref object\n"
   if o.doc.len > 0:
     result.add renderDoc(o.doc, 4)
   for p in o.properties:
@@ -240,37 +266,50 @@ proc emitAlias(ctx: EmitCtx; a: PdlAliasDecl): string =
   let nimType = typeName(ctx.domain.name, a.name)
   let base = ctx.emitType(a.base)
   let dep = a.deprecated or ctx.domain.deprecated
-  let exp = a.experimental or ctx.domain.experimental
-  result = "  " & nimType & "*" & pragmas(exp, dep) & " = " & base & "\n"
+  result = "  " & nimType & "*" & pragmas(dep) & " = " & base & "\n"
   if a.doc.len > 0:
     result.add renderDoc(a.doc, 4)
 
-# --------------------------------------------------------- commands -------
+# --------------------------------------------------- result/params types --
 
-proc emitResult(ctx: EmitCtx; cmd: PdlCommand): string =
+proc emitResultType(ctx: EmitCtx; cmd: PdlCommand): string =
   if cmd.returns.len == 0: return ""
-  let nimType = capitalizeAscii(cmd.name) & "Result"
+  let nimType = resultTypeName(ctx.domain.name, cmd.name)
   let dep = cmd.deprecated or ctx.domain.deprecated
-  let exp = cmd.experimental or ctx.domain.experimental
-  result = "  " & nimType & "*" & pragmas(exp, dep) & " = ref object\n"
+  result = "  " & nimType & "*" & pragmas(dep) & " = ref object\n"
   result.add "    ## Result of `" & ctx.domain.name & "." & cmd.name & "`.\n"
   for p in cmd.returns:
     result.add ctx.emitProperty(p, nimType)
 
+proc emitEventParamsType(ctx: EmitCtx; ev: PdlEvent): string =
+  let nimType = eventParamsTypeName(ctx.domain.name, ev.name)
+  let dep = ev.deprecated or ctx.domain.deprecated
+  result = "  " & nimType & "*" & pragmas(dep) & " = ref object\n"
+  if ev.doc.len > 0:
+    result.add renderDoc(ev.doc, 4)
+  if ev.parameters.len == 0 and ev.doc.len == 0:
+    result.add "    ## (no parameters)\n"
+  for p in ev.parameters:
+    result.add ctx.emitProperty(p, nimType)
+
+# --------------------------------------------------------- commands -------
+
 proc emitCommand(ctx: EmitCtx; cmd: PdlCommand): string =
   let pName = cmd.name
   let domainName = ctx.domain.name
-  let cap = capitalizeAscii(pName)
-  let retType = if cmd.returns.len == 0: "void" else: cap & "Result"
-  let futType = if retType == "void": "Future[void]"
-                else: "Future[" & retType & "]"
-  let paramOwner = cap & "Params"
+  let resultType =
+    if cmd.returns.len == 0: ""
+    else: resultTypeName(domainName, cmd.name)
+  let futType = if resultType == "": "Future[void]"
+                else: "Future[" & resultType & "]"
 
   var sigArgs = "client: CDPClient"
   for p in cmd.parameters:
-    let f = mangleField(p.name)
-    let nm = if f.needsBackticks: "`" & f.nim & "`" else: f.nim
-    ctx.inlineEnumOwner = paramOwner & toPascal(p.name)
+    let mp = mangleParam(p.name)
+    let nm = if mp.needsBackticks: "`" & mp.nim & "`" else: mp.nim
+    # Lift target for any inline enum on a parameter.
+    ctx.inlineEnumOwner = toPascal(domainName) & toPascal(pName) &
+                          "Params" & toPascal(p.name)
     var typ = ctx.emitType(p.typ)
     ctx.inlineEnumOwner = ""
     if p.optional: typ = "Option[" & typ & "]"
@@ -281,24 +320,21 @@ proc emitCommand(ctx: EmitCtx; cmd: PdlCommand): string =
     (if dep: "deprecated, " else: "") &
     "async: (raises: [CDPError, CDPTransportError, CancelledError]).}"
 
-  result = "proc " & pName & "*(" & sigArgs & "): " & futType & " " &
-           pragmaStr & " =\n"
+  let nimProcName = if isNimKeyword(pName): "`" & pName & "`" else: pName
+  result = "proc " & nimProcName & "*(" & sigArgs & "): " & futType &
+           " " & pragmaStr & " =\n"
   if cmd.doc.len > 0:
     result.add renderDoc(cmd.doc, 2)
 
-  # The marshal calls (`toJson`, `jsonTo`) are wrapped in
-  # ``{.cast(raises: [CatchableError]).}:`` because their inferred
-  # raises set transitively contains the bare ``system.Exception``
-  # type, which is a sibling of ``CatchableError`` (not a subtype) —
-  # so a plain ``except CatchableError`` does not satisfy the strict
-  # raises check on the async proc. The cast erases the inferred set
-  # at that point, leaving only what we re-raise from inside it (a
-  # CatchableError subtype if jsonutils raises one). The cast is also
-  # gcsafe-effect-clearing, so we don't need a separate gcsafe cast.
-  # See `/tmp/nim-raises-research.md` (and citations therein) for the
-  # full story; tl;dr: jsonutils has no explicit `raises:` pragma.
+  # Body. See docs/internal/nim-raises-research.md for why we wrap
+  # `toJson`/`jsonTo` in nested `cast(gcsafe)` + `cast(raises:
+  # [CatchableError])` blocks: jsonutils' inferred raises set
+  # transitively contains literal `system.Exception` (a sibling of
+  # `CatchableError`, not a subtype), which `except CatchableError`
+  # does NOT cover. The cast suppresses the inferred Exception at
+  # the call site so the surrounding handler can do its work.
   if cmd.parameters.len == 0:
-    if retType == "void":
+    if resultType == "":
       result.add "  let raw {.used.} = await client.sendCommand(\"" &
                  domainName & "." & pName & "\")\n"
     else:
@@ -307,7 +343,7 @@ proc emitCommand(ctx: EmitCtx; cmd: PdlCommand): string =
       result.add "  try:\n"
       result.add "    {.cast(gcsafe).}:\n"
       result.add "      {.cast(raises: [CatchableError]).}:\n"
-      result.add "        result = jsonTo(raw, " & retType & ")\n"
+      result.add "        result = jsonTo(raw, " & resultType & ", cdpDecodeOpts)\n"
       result.add "  except CatchableError as e:\n"
       result.add "    raise newException(CDPError,\n"
       result.add "      \"" & domainName & "." & pName &
@@ -318,18 +354,20 @@ proc emitCommand(ctx: EmitCtx; cmd: PdlCommand): string =
     result.add "    {.cast(gcsafe).}:\n"
     result.add "      {.cast(raises: [CatchableError]).}:\n"
     for p in cmd.parameters:
-      let f = mangleField(p.name)
-      let access = if f.needsBackticks: "`" & f.nim & "`" else: f.nim
+      let mp = mangleParam(p.name)
+      let access = if mp.needsBackticks: "`" & mp.nim & "`" else: mp.nim
       if p.optional:
         result.add "        if " & access & ".isSome:\n"
-        result.add "          params[\"" & p.name & "\"] = toJson(" & access & ".get)\n"
+        result.add "          params[\"" & mp.wire &
+                   "\"] = toJson(" & access & ".get)\n"
       else:
-        result.add "        params[\"" & p.name & "\"] = toJson(" & access & ")\n"
+        result.add "        params[\"" & mp.wire & "\"] = toJson(" &
+                   access & ")\n"
     result.add "  except CatchableError as e:\n"
     result.add "    raise newException(CDPError,\n"
     result.add "      \"" & domainName & "." & pName &
                ": encode failed: \" & e.msg)\n"
-    if retType == "void":
+    if resultType == "":
       result.add "  let raw {.used.} = await client.sendCommand(\"" &
                  domainName & "." & pName & "\", params)\n"
     else:
@@ -338,7 +376,7 @@ proc emitCommand(ctx: EmitCtx; cmd: PdlCommand): string =
       result.add "  try:\n"
       result.add "    {.cast(gcsafe).}:\n"
       result.add "      {.cast(raises: [CatchableError]).}:\n"
-      result.add "        result = jsonTo(raw, " & retType & ")\n"
+      result.add "        result = jsonTo(raw, " & resultType & ", cdpDecodeOpts)\n"
       result.add "  except CatchableError as e:\n"
       result.add "    raise newException(CDPError,\n"
       result.add "      \"" & domainName & "." & pName &
@@ -347,23 +385,10 @@ proc emitCommand(ctx: EmitCtx; cmd: PdlCommand): string =
 
 # --------------------------------------------------------- events ---------
 
-proc emitEventParams(ctx: EmitCtx; ev: PdlEvent): string =
-  let cap = capitalizeAscii(ev.name)
-  let paramsType = cap & "Params"
-  let dep = ev.deprecated or ctx.domain.deprecated
-  let exp = ev.experimental or ctx.domain.experimental
-  result = "  " & paramsType & "*" & pragmas(exp, dep) & " = ref object\n"
-  if ev.doc.len > 0:
-    result.add renderDoc(ev.doc, 4)
-  if ev.parameters.len == 0 and ev.doc.len == 0:
-    result.add "    ## (no parameters)\n"
-  for p in ev.parameters:
-    result.add ctx.emitProperty(p, paramsType)
-
 proc emitEventRegistration(ctx: EmitCtx; ev: PdlEvent): string =
-  let cap = capitalizeAscii(ev.name)
-  let paramsType = cap & "Params"
   let domainName = ctx.domain.name
+  let paramsType = eventParamsTypeName(domainName, ev.name)
+  let cap = capitalizeAscii(ev.name)
   result = "proc on" & cap & "*(client: CDPClient;\n"
   result.add "                  cb: proc(params: " & paramsType &
              ") {.gcsafe, raises: [].}) =\n"
@@ -371,109 +396,126 @@ proc emitEventRegistration(ctx: EmitCtx; ev: PdlEvent): string =
     result.add renderDoc(ev.doc, 2)
   result.add "  client.addEventListener(\"" & domainName & "." & ev.name &
              "\", proc(params: JsonNode) {.gcsafe, raises: [].} =\n"
-  # The marshal call sits inside ``cast(raises: [])`` so the inferred
-  # ``Exception`` from jsonutils doesn't escape the listener's
-  # ``raises: []`` contract. The local try/except converts any actual
-  # decode failure into a silent drop — listener callbacks must not
-  # raise out into the transport's dispatch loop.
   result.add "    var typed: " & paramsType & "\n"
   result.add "    {.cast(gcsafe).}:\n"
   result.add "      {.cast(raises: []).}:\n"
-  result.add "        try: typed = jsonTo(params, " & paramsType & ")\n"
+  result.add "        try: typed = jsonTo(params, " & paramsType & ", cdpDecodeOpts)\n"
   result.add "        except CatchableError: return\n"
   result.add "    cb(typed))\n\n"
 
-# --------------------------------------------------------- module --------
+# --------------------------------------------------- per-domain types -----
 
-proc moduleHeader(d: PdlDomain): string =
-  result = "## Bindings for the CDP `" & d.name & "` domain.\n"
-  if d.doc.len > 0:
-    result.add "##\n"
-    for line in d.doc: result.add "## " & line & "\n"
-  result.add "##\n"
-  result.add "## Generated from `resources/devtools-protocol/pdl/`. Do not edit by hand.\n\n"
+type
+  DomainTypes = object
+    ## All type-shaped output produced by walking one domain. The
+    ## types-module emitter concatenates these across every domain.
+    enums: seq[EnumBlock]
+    objectsAndAliases: string  # `  Foo* = ref object\n    ...\n`
+    resultsAndParams: string    # command result + event params decls
 
-proc emitDomain*(d: PdlDomain; registry: NameRegistry): string =
-  ## Emits the full text of `src/cdp/<domain>.nim` for `d`. Records
-  ## any enum wire mappings into `registry`. Cross-domain imports are
-  ## derived during emission and prepended to the output.
-  let ctx = EmitCtx(domain: d, imports: initHashSet[string](),
-                    registry: registry,
+proc collectDomainTypes(d: PdlDomain; registry: NameRegistry): DomainTypes =
+  let ctx = EmitCtx(domain: d, registry: registry,
                     liftedNames: initHashSet[string]())
 
-  # Pass: collect everything (and let inline-enum lifts populate
-  # ctx.lifted as a side-effect of property/parameter walks).
-  var topEnums: seq[EnumBlock]
-  var objects = ""
   for t in d.types:
     if t of PdlEnumDecl:
       let e = PdlEnumDecl(t)
-      let dep = e.deprecated or ctx.domain.deprecated
-      let exp = e.experimental or ctx.domain.experimental
-      topEnums.add registerEnum(ctx, typeName(d.name, e.name), e.members,
-                                  exp, dep, e.doc)
+      let dep = e.deprecated or d.deprecated
+      result.enums.add registerEnum(
+        ctx, typeName(d.name, e.name), e.members, dep, e.doc)
     elif t of PdlObjectDecl:
-      objects.add ctx.emitObject(PdlObjectDecl(t))
+      result.objectsAndAliases.add ctx.emitObject(PdlObjectDecl(t))
     elif t of PdlAliasDecl:
-      objects.add ctx.emitAlias(PdlAliasDecl(t))
+      result.objectsAndAliases.add ctx.emitAlias(PdlAliasDecl(t))
 
-  var resultsOut = ""
   for c in d.commands:
-    resultsOut.add ctx.emitResult(c)
+    # Walk command parameters too — they can carry inline enums that
+    # the per-domain emitter will reference via the synthetic type
+    # name. The lift side-effect populates ctx.lifted; the property
+    # walk's string output is discarded here (the actual signature
+    # render happens in emitCommand).
+    let owner = toPascal(d.name) & toPascal(c.name) & "Params"
+    for p in c.parameters:
+      discard ctx.emitProperty(p, owner)
+    result.resultsAndParams.add ctx.emitResultType(c)
 
-  var eventsParamsOut = ""
   for ev in d.events:
-    eventsParamsOut.add ctx.emitEventParams(ev)
+    result.resultsAndParams.add ctx.emitEventParamsType(ev)
 
-  var commandsOut = ""
-  for c in d.commands:
-    commandsOut.add ctx.emitCommand(c)
+  # Inline enums lifted during property walks land in ctx.lifted.
+  for blk in ctx.lifted:
+    result.enums.add blk
 
-  var eventsRegOut = ""
-  for ev in d.events:
-    eventsRegOut.add ctx.emitEventRegistration(ev)
+# --------------------------------------------------- module emitters -----
 
-  # Assemble.
-  result = moduleHeader(d)
-  result.add "import chronos\n"
+proc emitTypesModule*(domains: seq[PdlDomain];
+                       registry: NameRegistry): string =
+  ## Build the single shared types module — every PDL type from every
+  ## generated domain. Reserved (hand-written) domains are skipped.
+  result = "## Generated PDL types — every type, alias, command-result,\n"
+  result.add "## and event-params type from every CDP domain we generate.\n"
+  result.add "##\n"
+  result.add "## Generated from `resources/devtools-protocol/pdl/`. Do not edit by hand.\n\n"
   result.add "import std/[json, jsonutils, options]\n"
   result.add "import ../jsonhooks\n"
-  result.add "import ../transport\n"
-  var sortedImports = newSeq[string]()
-  for m in ctx.imports: sortedImports.add m
-  sortedImports.sort()
-  for m in sortedImports:
-    result.add "import " & m & "\n"
   result.add "\n"
 
-  let allEnums = topEnums & ctx.lifted
+  var allEnums: seq[EnumBlock]
+  var objects = ""
+  var resultsAndParams = ""
+  for d in domains:
+    if isHandWritten(d.name): continue
+    let dt = collectDomainTypes(d, registry)
+    for e in dt.enums: allEnums.add e
+    objects.add dt.objectsAndAliases
+    resultsAndParams.add dt.resultsAndParams
 
-  # Single `type` block holds enums, objects, command results, event params.
-  let hasTypes = allEnums.len > 0 or objects.len > 0 or
-                 resultsOut.len > 0 or eventsParamsOut.len > 0
-  if hasTypes:
+  if allEnums.len > 0 or objects.len > 0 or resultsAndParams.len > 0:
     result.add "type\n"
     for e in allEnums:
       result.add e.typeDecl
       result.add "\n"
     if objects.len > 0:
       result.add objects
-    if resultsOut.len > 0:
-      result.add resultsOut
-    if eventsParamsOut.len > 0:
-      result.add eventsParamsOut
+    if resultsAndParams.len > 0:
+      result.add resultsAndParams
+    result.add "\n"
 
-  # `const` block with one wire array per enum.
   if allEnums.len > 0:
-    result.add "\nconst\n"
+    result.add "const\n"
     for e in allEnums:
       result.add e.wireConst
     result.add "\n"
     for e in allEnums:
       result.add e.hooks
 
-  # Commands and event registrations.
-  if commandsOut.len > 0:
-    result.add commandsOut
-  if eventsRegOut.len > 0:
-    result.add eventsRegOut
+proc emitDomainModule*(d: PdlDomain; registry: NameRegistry): string =
+  ## Per-domain commands + event-registration module. Imports the
+  ## shared types module and the runtime transport.
+  ##
+  ## ``registry`` is the same one passed to ``emitTypesModule`` — used
+  ## here only by lift paths inside command parameter walks (rare;
+  ## most inline enums hang off properties which were already lifted
+  ## during the types pass).
+  let ctx = EmitCtx(domain: d, registry: registry,
+                    liftedNames: initHashSet[string]())
+
+  result = "## Generated bindings for the CDP `" & d.name & "` domain.\n"
+  if d.doc.len > 0:
+    result.add "##\n"
+    for line in d.doc: result.add "## " & line & "\n"
+  result.add "##\n"
+  result.add "## Generated from `resources/devtools-protocol/pdl/`. Do not edit by hand.\n\n"
+  result.add "import chronos\n"
+  result.add "import std/[json, jsonutils, options]\n"
+  result.add "import ../jsonhooks\n"
+  result.add "import ../transport\n"
+  result.add "import ./types\n"
+  result.add "export types\n"
+  result.add "\n"
+
+  for c in d.commands:
+    result.add ctx.emitCommand(c)
+
+  for ev in d.events:
+    result.add ctx.emitEventRegistration(ev)
