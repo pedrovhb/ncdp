@@ -50,6 +50,7 @@ type
 
   ChromeProcess* = ref object
     handle: AsyncProcessRef
+    outputDrainer: Future[void]
     wsUrl*: string
       ## Browser-level websocket URL (the ``webSocketDebuggerUrl`` from
       ## ``/json/version``). Pass this straight to
@@ -170,7 +171,9 @@ proc buildArgs(opts: LaunchOptions; userDataDir: string): seq[string] =
     "--disable-background-networking",
     "--disable-component-update",
     "--disable-sync",
+    "--disable-logging",
     "--metrics-recording-only",
+    "--log-level=3",
     "--disable-features=Translate,MediaRouter",
     "--mute-audio",
     "--password-store=basic",
@@ -181,6 +184,20 @@ proc buildArgs(opts: LaunchOptions; userDataDir: string): seq[string] =
     result.add "--disable-gpu"
   for a in opts.extraArgs: result.add a
   result.add "about:blank"
+
+proc drainChromeOutput(p: AsyncProcessRef): Future[void] {.
+    async: (raises: [CancelledError]).} =
+  ## Chrome writes unrelated diagnostics to stdout/stderr, including some
+  ## before its logging flags take effect. Capture and drain the stream so
+  ## examples stay quiet and Chrome cannot block on a full pipe. The bytes
+  ## are intentionally discarded for now; this keeps a single place to add
+  ## opt-in surfacing later.
+  try:
+    discard await p.stdoutStream.read()
+  except CancelledError as e:
+    raise e
+  except CatchableError:
+    discard
 
 proc fetchVersion(host: string; port: int): Future[JsonNode] {.
     async: (raises: [ChromeError, CancelledError]).} =
@@ -337,10 +354,6 @@ proc launch*(opts = initLaunchOptions()): Future[ChromeProcess] {.
     try: createDir(dataDir)
     except CatchableError as e:
       fail("could not create user-data dir: " & e.msg)
-  # Chrome's stderr is left unredirected and prints to the parent's
-  # terminal. That's loud but cheap; a future revision can wire
-  # stdoutHandle / stderrHandle through `ProcessStreamHandle.init` to
-  # capture or discard the output.
   let args = buildArgs(opts, dataDir)
   # ``ProcessGroup`` puts chrome and every helper it spawns (zygote,
   # renderer, GPU broker) into a fresh process group whose pgid equals
@@ -350,7 +363,9 @@ proc launch*(opts = initLaunchOptions()): Future[ChromeProcess] {.
   # open, causing ``removeDir`` to silently fail.
   let process = try:
       await startProcess(exe, arguments = args,
-                         options = {AsyncProcessOption.ProcessGroup})
+                         options = {AsyncProcessOption.ProcessGroup,
+                                    AsyncProcessOption.StdErrToStdOut},
+                         stdoutHandle = AsyncProcess.Pipe)
     except CancelledError as e:
       if createdDataDir:
         try: removeDir(dataDir)
@@ -361,9 +376,12 @@ proc launch*(opts = initLaunchOptions()): Future[ChromeProcess] {.
         try: removeDir(dataDir)
         except CatchableError: discard
       raise newException(ChromeError, "startProcess failed: " & e.msg)
+  let outputDrainer = drainChromeOutput(process)
+  asyncSpawn outputDrainer
 
   result = ChromeProcess(
     handle: process,
+    outputDrainer: outputDrainer,
     httpBase: &"http://{opts.host}:{opts.port}",
     userDataDir: if createdDataDir: dataDir else: "",
   )
@@ -375,6 +393,9 @@ proc launch*(opts = initLaunchOptions()): Future[ChromeProcess] {.
     except CatchableError: discard
     try: await process.closeWait()
     except CatchableError: discard
+    if not outputDrainer.finished:
+      try: await outputDrainer.cancelAndWait()
+      except CatchableError: discard
     unregisterLiveProcess(result)
     if result.userDataDir.len > 0:
       try: removeDir(result.userDataDir)
@@ -441,6 +462,10 @@ proc terminate*(p: ChromeProcess; grace = 3.seconds): Future[void] {.
 
   try: await p.handle.closeWait()
   except CatchableError: discard
+
+  if not p.outputDrainer.isNil and not p.outputDrainer.finished:
+    try: await p.outputDrainer.cancelAndWait()
+    except CatchableError: discard
 
   unregisterLiveProcess(p)
 

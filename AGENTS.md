@@ -6,18 +6,15 @@ anything non-trivial.
 
 ## What this is
 
-Nim Chrome DevTools Protocol bindings — `ncdp`. Two parts so far:
+Nim Chrome DevTools Protocol bindings — `ncdp`. Three parts:
 
 * **PDL parser** (`src/gen/pdl/`) — reads the Chrome DevTools Protocol
   grammar files and produces an AST.
 * **CDP runtime** (`src/cdp/`) — `transport.nim`, `chrome.nim`,
-  `jsonhooks.nim`, plus a few hand-written domain modules
-  (`schema.nim`, `system_info.nim`, `browser.nim`) that act as the
-  reference shape the eventual codegen has to reproduce.
-
-The next phase is the code generator (`src/gen/cdp/`, doesn't exist yet)
-that walks the PDL AST and emits one Nim module per domain matching the
-hand-written reference modules byte-for-byte.
+  `jsonhooks.nim`, and `logging.nim`.
+* **CDP code generator** (`src/gen/cdp/`) — walks the PDL AST and emits
+  generated bindings under the ignored `src/cdp/gen/` directory: one
+  shared `types.nim` module plus one command/event module per domain.
 
 ## Where the project memory lives
 
@@ -48,15 +45,19 @@ directory and link it from `MEMORY.md`. Every memory file has frontmatter
 * `Option[T]` for PDL `optional` fields. Outbound omission is handled in
   `transport.sendCommand` via `dropNullFields`, not at every call site.
 * PDL named enums → Nim enums with type-prefixed members
-  (`SubsamplingFormat.sfYuv420`), paired with a `XxxWire: array[T,
-  string]` constant and `to/fromJsonHook` overloads. The wire spelling
-  never appears in user code.
-* Module layout: `src/cdp/<snake_name>.nim` per domain. Codegen will
-  emit there too once it lands.
+  was the old plan. Current generated enums are `{.pure.}` with
+  qualified PascalCase members (`SubsamplingFormat.Yuv420`), paired
+  with a `XxxWire: array[T, string]` constant and `to/fromJsonHook`
+  overloads. The wire spelling never appears in user code.
+* Module layout: hand-written runtime modules live at `src/cdp/*.nim`;
+  generated domain modules live at `src/cdp/gen/<snake_name>.nim` and
+  share `src/cdp/gen/types.nim`.
 
 ## Building & running
 
-* `nimble test` — parser + transport unit tests.
+* `nimble test` — parser, transport, name-mangling, codegen, and
+  generated-corpus compile tests.
+* `nimble gen` — regenerate ignored bindings under `src/cdp/gen/`.
 * `nim c -d:ssl -r examples/gen/ex_02_call_browser_getVersion.nim` —
   end-to-end smoke against a launched Chrome. Needs
   `LD_LIBRARY_PATH=/run/current-system/sw/share/nix-ld/lib` at runtime
@@ -66,7 +67,7 @@ directory and link it from `MEMORY.md`. Every memory file has frontmatter
 
 ## Code review
 
-When reviewing or being reviewed: read the hand-written reference
-modules (`schema.nim`, `system_info.nim`) carefully — every shape choice
-there will be reproduced ~50 times by codegen. Comments on idiom there
-are unusually high-leverage.
+When reviewing or being reviewed: focus especially on `src/gen/cdp/emit.nim`,
+`src/gen/cdp/names.nim`, and representative generated output. Shape choices
+there affect every CDP domain, so comments on naming, optional handling,
+raises sets, and JSON hooks are unusually high-leverage.

@@ -11,6 +11,9 @@ requires "chronos >= 4.2.2"
 requires "chronicles >= 0.12.2"
 # nws_client is consumed via a path switch in config.nims (see /app/nws_client).
 
+task gen, "Regenerate CDP bindings from bundled PDL files":
+  exec "nim c -r --hints:off src/gen/cdp/driver.nim"
+
 task test, "Run the test suite":
   exec "nim c -r --hints:off tests/tpdl_parser.nim"
   exec "nim c -r --hints:off tests/ttransport.nim"
