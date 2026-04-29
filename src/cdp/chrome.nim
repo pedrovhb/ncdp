@@ -258,6 +258,61 @@ proc discover*(host = "127.0.0.1"; port = 9222): Future[string] {.
     fail("/json/version: missing webSocketDebuggerUrl")
   rewriteAuthority(url.getStr(), host, port)
 
+proc fetchWithMethod(host: string; port: int; path: string;
+                      meth: HttpMethod): Future[JsonNode] {.
+    async: (raises: [ChromeError, CancelledError]).} =
+  ## Issue an HTTP request against chrome's debugger REST endpoints
+  ## with a non-GET method. chronos's `session.fetch(url)` is
+  ## GET-only, so we go via `HttpClientRequestRef.new`.
+  let session = HttpSessionRef.new()
+  defer:
+    try: await session.closeWait()
+    except CancelledError: discard
+  let req = HttpClientRequestRef.new(
+    session, &"http://{host}:{port}{path}", meth = meth).valueOr:
+      raise newException(ChromeError, "bad URL: " & $error)
+  defer:
+    try: await req.closeWait()
+    except CancelledError: discard
+  var resp: HttpResponseTuple
+  try:
+    resp = await req.fetch()
+  except CancelledError as e: raise e
+  except CatchableError as e:
+    raise newException(ChromeError, &"{path} fetch failed: " & e.msg)
+  if resp.status != 200:
+    fail(&"{path} returned HTTP {resp.status}")
+  var body = newString(resp.data.len)
+  for i in 0 ..< resp.data.len: body[i] = char(resp.data[i])
+  try: parseJson(body)
+  except CatchableError as e:
+    raise newException(ChromeError, &"{path}: bad JSON: " & e.msg)
+
+proc newTab*(host: string; port: int;
+              url = "about:blank"): Future[string] {.
+    async: (raises: [ChromeError, CancelledError]).} =
+  ## Open a new browser tab via Chrome's `PUT /json/new?<url>` REST
+  ## convenience endpoint and return its `webSocketDebuggerUrl`. The
+  ## endpoint creates an honest target (a separate page-scoped
+  ## websocket) so a CDPClient connected to the returned URL can
+  ## issue `Page.*`, `Runtime.*`, `DOM.*` etc. without needing
+  ## session routing on top of the browser-level websocket.
+  let info = await fetchWithMethod(host, port, "/json/new?" & url, MethodPut)
+  let wsUrl = info.getOrDefault("webSocketDebuggerUrl")
+  if wsUrl.isNil or wsUrl.kind != JString:
+    fail("/json/new: missing webSocketDebuggerUrl")
+  rewriteAuthority(wsUrl.getStr(), host, port)
+
+proc closeTab*(host: string; port: int; targetId: string):
+    Future[void] {.async: (raises: [ChromeError, CancelledError]).} =
+  ## Close a tab opened via `newTab`. Best-effort — chrome may have
+  ## already disposed the target if the underlying page was closed.
+  try:
+    discard await fetchWithMethod(host, port, "/json/close/" & targetId,
+                                  MethodGet)
+  except ChromeError:
+    discard  # tab might be gone already; not worth raising
+
 proc launch*(opts = initLaunchOptions()): Future[ChromeProcess] {.
     async: (raises: [ChromeError, CancelledError]).} =
   ## Spawn a fresh chrome process and return a handle once the
