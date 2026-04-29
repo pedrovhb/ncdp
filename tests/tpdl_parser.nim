@@ -138,6 +138,27 @@ domain Foo
 """)
     check f.domains[0].types[0].doc == @["First line.", "Second line."]
 
+  test "doc comments attach to enum members at deeper indent":
+    # Regression for the case in domains/Input.pdl where enum members
+    # are 4-space-indented inside the ``enum`` block instead of 2.
+    # Doc comments living at the deeper indent must survive.
+    let f = parsePdl("""
+domain Foo
+  type Color extends string
+    enum
+        # red.
+        red
+        # green.
+        green
+""")
+    let t = f.domains[0].types[0]
+    check t of PdlEnumDecl
+    let e = PdlEnumDecl(t)
+    check e.members.len == 2
+    check e.members[0].name == "red"
+    check e.members[0].doc == @["red."]
+    check e.members[1].doc == @["green."]
+
   test "blank line detaches doc block":
     let f = parsePdl("""
 domain Foo

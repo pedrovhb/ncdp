@@ -13,10 +13,13 @@
 ## `terminate`: SIGTERM with a configurable grace period, falling back
 ## to SIGKILL, then deleting the temporary user-data dir.
 
-import std/[json, os, strformat]
+import std/[exitprocs, json, os, strformat, strutils, sysrand]
 import chronos
 import chronos/asyncproc
 import chronos/apps/http/httpclient
+
+when defined(posix):
+  import std/posix
 
 type
   LaunchOptions* = object
@@ -56,6 +59,34 @@ type
   ChromeError* = object of CatchableError
     ## Any failure from this module: missing binary, boot timeout,
     ## non-200 response from the discovery endpoint, malformed JSON.
+
+# ----------------------------- exit-handler bookkeeping -------------------
+
+var liveProcesses {.threadvar.}: seq[ChromeProcess]
+var exitHandlerRegistered {.threadvar.}: bool
+
+proc killOnExit() {.noconv.} =
+  ## Last-ditch cleanup invoked from ``addExitProc``. We can't run
+  ## async code here, so on POSIX we send SIGKILL to the whole process
+  ## group of every still-live ``ChromeProcess`` and recursively delete
+  ## its user-data dir. On Windows we currently do nothing — the
+  ## process and its job-object children will be reaped by the OS once
+  ## our process exits.
+  for p in liveProcesses:
+    if p.handle.isNil: continue
+    when defined(posix):
+      let pid = Pid(p.handle.pid)
+      discard posix.kill(-pid, SIGKILL)  # negative pid → process group
+    if p.userDataDir.len > 0:
+      try: removeDir(p.userDataDir)
+      except CatchableError: discard
+  liveProcesses.setLen(0)
+
+proc registerExitHandler() =
+  if not exitHandlerRegistered:
+    {.cast(gcsafe).}:
+      addExitProc(killOnExit)
+    exitHandlerRegistered = true
 
 # -------------------------------------------------------- defaults ----------
 
@@ -97,6 +128,19 @@ proc resolveExecutable(override: string): string =
   fail("could not find Chrome / Chromium on PATH; " &
        "set NCDP_CHROME or pass LaunchOptions.executable")
 
+proc uniqueDataDir(): string =
+  ## Build a temp directory path with enough entropy (8 random bytes)
+  ## that two concurrent ``launch`` calls — or a fresh launch sharing
+  ## the same pid/port as a stale crashed one — can't collide.
+  var rnd = newSeq[byte](8)
+  if not urandom(rnd):
+    # urandom shouldn't fail in practice, but if it does we still want
+    # *some* uniqueness — fall back to pid+counter-style naming.
+    rnd = @[byte(getCurrentProcessId() and 0xff)]
+  var hex = ""
+  for b in rnd: hex.add b.toHex(2)
+  getTempDir() / &"ncdp-chrome-{hex.toLowerAscii()}"
+
 proc buildArgs(opts: LaunchOptions; userDataDir: string): seq[string] =
   ## Compose the chrome command line. Most defaults exist to keep the
   ## headless instance from doing anything we didn't ask for: no first-
@@ -104,6 +148,7 @@ proc buildArgs(opts: LaunchOptions; userDataDir: string): seq[string] =
   ## extensions, no GPU init when we won't render anything.
   result = @[
     &"--remote-debugging-port={opts.port}",
+    &"--remote-debugging-address={opts.host}",
     &"--user-data-dir={userDataDir}",
     "--no-first-run",
     "--no-default-browser-check",
@@ -205,31 +250,45 @@ proc launch*(opts = initLaunchOptions()): Future[ChromeProcess] {.
   let exe = try: resolveExecutable(opts.executable)
             except OSError as e:
               raise newException(ChromeError, e.msg)
+  let createdDataDir = opts.userDataDir.len == 0
   let dataDir =
-    if opts.userDataDir.len > 0:
-      opts.userDataDir
-    else:
-      let d = getTempDir() / &"ncdp-chrome-{getCurrentProcessId()}-{opts.port}"
-      try: createDir(d)
-      except CatchableError as e:
-        fail("could not create user-data dir: " & e.msg)
-      d
-  let args = buildArgs(opts, dataDir)
+    if createdDataDir: uniqueDataDir() else: opts.userDataDir
+  if createdDataDir:
+    try: createDir(dataDir)
+    except CatchableError as e:
+      fail("could not create user-data dir: " & e.msg)
   # Chrome's stderr is left unredirected and prints to the parent's
   # terminal. That's loud but cheap; a future revision can wire
   # stdoutHandle / stderrHandle through `ProcessStreamHandle.init` to
   # capture or discard the output.
+  let args = buildArgs(opts, dataDir)
+  # ``ProcessGroup`` puts chrome and every helper it spawns (zygote,
+  # renderer, GPU broker) into a fresh process group whose pgid equals
+  # the chrome pid. That lets ``terminate`` signal the whole tree
+  # rather than just the parent — without it we routinely returned
+  # from ``terminate`` while a renderer still held the user-data dir
+  # open, causing ``removeDir`` to silently fail.
   let process = try:
-      await startProcess(exe, arguments = args)
-    except CancelledError as e: raise e
+      await startProcess(exe, arguments = args,
+                         options = {AsyncProcessOption.ProcessGroup})
+    except CancelledError as e:
+      if createdDataDir:
+        try: removeDir(dataDir)
+        except CatchableError: discard
+      raise e
     except CatchableError as e:
+      if createdDataDir:
+        try: removeDir(dataDir)
+        except CatchableError: discard
       raise newException(ChromeError, "startProcess failed: " & e.msg)
 
   result = ChromeProcess(
     handle: process,
     httpBase: &"http://{opts.host}:{opts.port}",
-    userDataDir: if opts.userDataDir.len > 0: "" else: dataDir,
+    userDataDir: if createdDataDir: dataDir else: "",
   )
+  registerExitHandler()
+  liveProcesses.add(result)
   template tearDownAndRaise(err: untyped) =
     # Boot failed — tear the process down before propagating.
     try: discard process.terminate()
@@ -251,28 +310,56 @@ proc launch*(opts = initLaunchOptions()): Future[ChromeProcess] {.
   except CancelledError as e:
     tearDownAndRaise(e)
 
+when defined(posix):
+  proc signalGroup(p: ChromeProcess; sig: cint) =
+    ## Send ``sig`` to the entire process group whose pgid is the
+    ## chrome pid (chronos's ``ProcessGroup`` option made the chrome
+    ## process the leader of a fresh group). Failures are intentionally
+    ## ignored — by the time we get here the group may already be gone.
+    let pid = Pid(p.handle.pid)
+    discard posix.kill(-pid, sig)
+
 proc terminate*(p: ChromeProcess; grace = 3.seconds): Future[void] {.
     async: (raises: [CancelledError]).} =
-  ## Stop the process. Tries SIGTERM, waits up to ``grace`` for an
-  ## exit, falls back to SIGKILL, then closes pipes and (if we created
-  ## one) removes the temporary user-data dir. Idempotent and safe to
-  ## call from a ``finally`` block; nothing here re-raises beyond
-  ## cancellation.
+  ## Stop the process tree. Sends SIGTERM to the whole process group
+  ## (chrome + zygote + renderers + GPU helper), waits up to ``grace``
+  ## for the parent to exit, escalates to SIGKILL if the grace period
+  ## elapses, then removes the temporary user-data dir. Idempotent and
+  ## safe to call from a ``finally`` block; nothing here re-raises
+  ## beyond cancellation.
   if p.handle.isNil: return
-  try: discard p.handle.terminate()
-  except CatchableError: discard
+
+  when defined(posix):
+    p.signalGroup(SIGTERM)
+  else:
+    try: discard p.handle.terminate()
+    except CatchableError: discard
+
   try:
     discard await p.handle.waitForExit().wait(grace)
   except AsyncTimeoutError:
-    try: discard p.handle.kill()
-    except CatchableError: discard
+    when defined(posix):
+      p.signalGroup(SIGKILL)
+    else:
+      try: discard p.handle.kill()
+      except CatchableError: discard
     try: discard await p.handle.waitForExit().wait(grace)
     except CatchableError: discard
   except CancelledError as e:
     raise e
   except CatchableError: discard
+
   try: await p.handle.closeWait()
   except CatchableError: discard
+
+  # Drop from the exit-handler list now that we've cleaned up
+  # explicitly. (Linear scan is fine — we expect a handful of live
+  # processes at most.)
+  for i in 0 ..< liveProcesses.len:
+    if liveProcesses[i] == p:
+      liveProcesses.del(i)
+      break
+
   if p.userDataDir.len > 0:
     try: removeDir(p.userDataDir)
     except CatchableError: discard

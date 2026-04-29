@@ -40,6 +40,20 @@ suite "transport — response dispatch":
     # No pending Future for id=99 — must not raise.
     c.dispatchResponse(%*{"id": 99, "result": {}})
 
+  test "onRunnerDone fails pending without a Closed event":
+    proc body() =
+      # Simulate the receive loop ending abnormally (e.g. cancelled or
+      # a Defect bubbled past the raises annotation): the addCallback
+      # hook should still flush pending Futures so callers don't hang.
+      let c = newTestClient()
+      let fut = c.registerPendingForTest(42)
+      let runner = newFuture[void]("test.runner")
+      runner.addCallback(onRunnerDone, cast[pointer](c))
+      runner.complete()  # fires the callback synchronously
+      check fut.finished
+      expect CDPTransportError:
+        discard waitFor fut
+
 suite "transport — event dispatch":
 
   # Each test wraps its body in a proc so the closure captures stay

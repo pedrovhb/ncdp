@@ -146,11 +146,32 @@ proc registerPendingForTest*(c: CDPClient; id: int): Future[JsonNode] =
 
 # ------------------------------------------------------- public surface ----
 
+proc onRunnerDone*(udata: pointer) {.gcsafe, raises: [].} =
+  ## Settling-side cleanup attached to ``client.runner`` via
+  ## ``addCallback``. Whatever path ended the runner — a regular
+  ## ``WSEventKind.Closed`` event already failed pending Futures and
+  ## set ``closed`` (so this is a no-op then), or cancellation /
+  ## a ``Defect`` slipped past the ``raises: [CancelledError]``
+  ## annotation, in which case we still need to flush pending Futures
+  ## so callers don't hang on them forever.
+  let client = cast[CDPClient](udata)
+  if client.isNil or client.closed: return
+  client.closed = true
+  client.failPending("receive loop ended without Closed event")
+
 proc connect*(url: string): Future[CDPClient] {.
     async: (raises: [CDPTransportError, CancelledError]).} =
   ## Opens a websocket to ``url`` (typically ``ws://localhost:9222/...``)
   ## and starts the receive loop in the background. The returned client
   ## is ready to accept ``sendCommand`` calls.
+  ##
+  ## A cleanup callback is attached to the runner Future so that if the
+  ## receive loop terminates by any path other than emitting a
+  ## ``WSEventKind.Closed`` (notably cancellation), pending requests
+  ## are still failed. ``nws_client.run`` declares itself
+  ## ``raises: [CancelledError]`` and otherwise turns transport-level
+  ## errors into ``Closed`` events, but we don't rely on that contract
+  ## holding under every edge case.
   let client = CDPClient()
   try:
     client.ws = await nws_client.connect(url)
@@ -160,6 +181,7 @@ proc connect*(url: string): Future[CDPClient] {.
       {.async: (raises: [CancelledError]).} =
     await onEvent(ws, ev, client)
   client.runner = nws_client.run(client.ws, handler)
+  client.runner.addCallback(onRunnerDone, cast[pointer](client))
   asyncSpawn client.runner
   client
 
@@ -168,9 +190,12 @@ proc sendCommand*(c: CDPClient; methodName: string;
     async: (raises: [CDPError, CDPTransportError, CancelledError]).} =
   ## Send a JSON-RPC command, return the ``result`` member of the
   ## response. ``params`` may be nil (no params on the wire), a
-  ## ``JObject`` (sent as-is after stripping ``null`` fields), or any
-  ## other JSON node (the protocol forbids it but we don't second-guess
-  ## the caller).
+  ## ``JObject``, or any other JSON node (the protocol forbids
+  ## non-objects but we don't second-guess the caller).
+  ##
+  ## ``params`` is **not** mutated: ``sendCommand`` deep-copies it
+  ## before stripping ``null`` fields, so callers can safely pass
+  ## a node they intend to inspect or reuse afterwards.
   if c.closed:
     raise newException(CDPTransportError, "client is closed")
   let id = c.allocId()
@@ -178,8 +203,9 @@ proc sendCommand*(c: CDPClient; methodName: string;
   frame["id"] = newJInt(id)
   frame["method"] = newJString(methodName)
   if params != nil and params.kind != JNull:
-    dropNullFields(params)
-    frame["params"] = params
+    let owned = json.copy(params)
+    dropNullFields(owned)
+    frame["params"] = owned
   let fut = newFuture[JsonNode]("cdp.sendCommand")
   {.cast(gcsafe).}:
     {.cast(raises: []).}:

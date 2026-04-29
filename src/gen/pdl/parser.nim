@@ -179,7 +179,25 @@ proc parseEnumMembers(p: Parser; minIndent: int): seq[PdlEnumMember] =
   ## enum members 4 spaces inside an ``enum`` block instead of 2.
   var memberIndent = -1
   while true:
-    skipTrivia(p, minIndent)
+    if memberIndent == -1:
+      # First member not yet seen — we don't know which indent the doc
+      # comments will live at, so collect anything at ``minIndent`` or
+      # deeper as candidate doc-comment trivia and let the next decl
+      # claim it via ``takeDoc``.
+      while not p.atEnd:
+        let l = p.lines[p.pos]
+        if l.isBlank:
+          if p.pendingDoc.len > 0: p.pendingDoc.setLen(0)
+          inc p.pos
+        elif l.isComment and l.indent >= minIndent:
+          p.pendingDoc.add l.raw
+          inc p.pos
+        elif l.isComment:
+          inc p.pos     # comment outdented past the enum — drop
+        else:
+          break
+    else:
+      skipTrivia(p, memberIndent)
     if p.atEnd or p.current.indent < minIndent: break
     let l = p.current
     if memberIndent == -1:

@@ -18,7 +18,6 @@
 ## Source PDL: `resources/devtools-protocol/pdl/domains/SystemInfo.pdl`,
 ## `experimental domain SystemInfo`.
 
-import std/strutils
 import chronos
 import ./jsonhooks
 import ./transport
