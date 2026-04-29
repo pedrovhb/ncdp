@@ -1,0 +1,3 @@
+- [Chrome Host header CDP gotcha](project_chrome_host_header.md) — Chrome echoes the request `Host:` header into `webSocketDebuggerUrl`, dropping the port; rewrite the authority client-side.
+- [LD_LIBRARY_PATH for Nix-built Nim binaries](project_nix_ld_library_path.md) — runtime SSL/openssl symbols missing without `LD_LIBRARY_PATH=/run/current-system/sw/share/nix-ld/lib`.
+- [Project layout](project_layout.md) — ncdp source tree, paths, key references.

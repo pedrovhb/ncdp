@@ -1,0 +1,15 @@
+# Build artifacts
+nimcache/
+*.exe
+*.o
+*.so
+*.dylib
+
+# Built example binaries (no extension on Linux/macOS).
+examples/gen/ex_01_parse_summary
+examples/gen/ex_02_call_browser_getVersion
+examples/gen/ex_02_call_schema_getDomains
+
+# Built test binaries
+tests/tpdl_parser
+tests/ttransport
