@@ -59,18 +59,30 @@ module-level `logScope`, or pass them per-statement with
 
 ## Request-id threading
 
+**Caveat — `dynamicLogScope` is unsafe across `await`.** Chronicles
+pins the binding frame on the stack and stashes its address in a TLS
+slot; once the proc suspends at `await`, that pointer is dangling and
+any later log call from another async frame segfaults. See the
+`XXX` "resumable functions" comment in
+`chronicles/dynamic_scope.nim`.
+
+So we **pass `id` explicitly** on every log call inside an async
+proc. It's slightly more verbose than the dynamicLogScope dream, but
+it is the only safe pattern under chronos:
+
 ```nim
 proc sendCommand(...) {.async.} =
   let id = c.allocId()
-  dynamicLogScope(id):
-    info "request sent", `method` = methodName
-    # ...
-    let res = await fut
-    info "response received", latency = elapsed
+  let started = Moment.now()
+  debug "request sent", id, `method` = methodName
+  let res = await fut
+  debug "response received", id, `method` = methodName,
+        latency = Moment.now() - started
 ```
 
-Every record in the dynamic scope's call tree carries `id=N` without
-the called code knowing.
+A future iteration could write a chronos-aware scope helper that
+restores the binding frame after each `await` resume, but that is a
+chronicles upstream change and not on the runway here.
 
 ## Async + raises
 

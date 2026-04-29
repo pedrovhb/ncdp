@@ -16,6 +16,10 @@ import std/[json, tables]
 import chronos
 import nws_client
 import ./jsonhooks
+import ./log
+
+logScope:
+  topics = "transport"
 
 type
   CDPError* = object of CatchableError
@@ -92,6 +96,10 @@ proc dispatchEvent*(c: CDPClient; frame: JsonNode) {.raises: [].} =
   let params = frame.getOrDefault("params")
   let p = if params.isNil: newJObject() else: params
   let cbs = c.listeners.getOrDefault(m)
+  if cbs.len == 0:
+    trace "event dropped", event = m
+    return
+  debug "event fired", event = m, listeners = cbs.len
   for cb in cbs:
     cb(p)
 
@@ -107,6 +115,7 @@ proc onEvent(ws: WSClient; ev: WSEvent;
   of WSEventKind.Open:
     discard
   of WSEventKind.Text:
+    trace "frame received", kind = "text", bytes = ev.text.len
     var parsed: JsonNode
     try:
       parsed = parseJson(ev.text)
@@ -125,8 +134,10 @@ proc onEvent(ws: WSClient; ev: WSEvent;
   of WSEventKind.Binary:
     # CDP is text-only; binary frames are protocol violations on
     # chrome's side. Drop them.
+    trace "frame received", kind = "binary", bytes = ev.data.len
     discard
   of WSEventKind.Closed:
+    trace "frame received", kind = "closed", code = int(ev.code)
     c.closed = true
     c.failPending("transport closed: " & $int(ev.code) & " " & ev.reason)
 
@@ -176,6 +187,7 @@ proc connect*(url: string): Future[CDPClient] {.
   try:
     client.ws = await nws_client.connect(url)
   except CatchableError as e:
+    error "transport connect failed", url = url, err = e.msg
     raise newException(CDPTransportError, "connect failed: " & e.msg)
   let handler: WSHandler = proc(ws: WSClient; ev: WSEvent): Future[void]
       {.async: (raises: [CancelledError]).} =
@@ -183,6 +195,7 @@ proc connect*(url: string): Future[CDPClient] {.
   client.runner = nws_client.run(client.ws, handler)
   client.runner.addCallback(onRunnerDone, cast[pointer](client))
   asyncSpawn client.runner
+  info "transport connected", url = url
   client
 
 proc sendCommand*(c: CDPClient; methodName: string;
@@ -199,6 +212,13 @@ proc sendCommand*(c: CDPClient; methodName: string;
   if c.closed:
     raise newException(CDPTransportError, "client is closed")
   let id = c.allocId()
+  # NOTE: ``dynamicLogScope`` would be the natural fit here for threading
+  # ``id=N`` through every record produced inside this proc, but
+  # chronicles' implementation pins the binding frame on the stack and
+  # writes its address into a TLS slot — that pointer is dangling across
+  # any chronos ``await``. Pass ``id`` explicitly on each call instead.
+  # See `chronicles/dynamic_scope.nim` and the "resumable functions"
+  # XXX comment therein.
   let frame = newJObject()
   frame["id"] = newJInt(id)
   frame["method"] = newJString(methodName)
@@ -210,16 +230,24 @@ proc sendCommand*(c: CDPClient; methodName: string;
   {.cast(gcsafe).}:
     {.cast(raises: []).}:
       c.pending[id] = fut
+  let started = Moment.now()
   try:
     await c.ws.send($frame)
   except CatchableError as e:
     {.cast(gcsafe).}:
       {.cast(raises: []).}:
         c.pending.del(id)
+    error "request send failed", id = id, `method` = methodName, err = e.msg
     raise newException(CDPTransportError, "send failed: " & e.msg)
+  debug "request sent", id = id, `method` = methodName
   try:
-    return await fut
+    let res = await fut
+    debug "response received", id = id, `method` = methodName,
+          latency = Moment.now() - started
+    return res
   except CDPError as e:
+    debug "response error", id = id, `method` = methodName, code = e.code,
+          err = e.msg, latency = Moment.now() - started
     raise e
   except CancelledError as e:
     raise e
@@ -248,3 +276,4 @@ proc close*(c: CDPClient): Future[void] {.async: (raises: [CancelledError]).} =
     except CatchableError:
       discard
   c.failPending("client closed by caller")
+  info "transport closed"

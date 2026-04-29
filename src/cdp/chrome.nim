@@ -17,9 +17,13 @@ import std/[exitprocs, json, os, strformat, strutils, sysrand]
 import chronos
 import chronos/asyncproc
 import chronos/apps/http/httpclient
+import ./log
 
 when defined(posix):
   import std/posix
+
+logScope:
+  topics = "chrome"
 
 type
   LaunchOptions* = object
@@ -72,6 +76,7 @@ proc killOnExit() {.noconv.} =
   ## its user-data dir. On Windows we currently do nothing — the
   ## process and its job-object children will be reaped by the OS once
   ## our process exits.
+  trace "exit handler firing", count = liveProcesses.len
   for p in liveProcesses:
     if p.handle.isNil: continue
     when defined(posix):
@@ -198,17 +203,28 @@ proc waitForBoot(host: string; port: int;
     async: (raises: [ChromeError, CancelledError]).} =
   ## Poll ``/json/version`` until it answers or ``timeout`` elapses.
   ## Backoff: 50 ms → 100 ms → 200 ms, capped at 500 ms.
-  let deadline = Moment.now() + timeout
+  let started = Moment.now()
+  let deadline = started + timeout
   var delay = 50.milliseconds
   var lastErr = ""
+  var attempt = 0
   while Moment.now() < deadline:
+    inc attempt
+    let elapsed = Moment.now() - started
+    trace "boot poll", attempt = attempt, elapsed = elapsed
     try:
-      return await fetchVersion(host, port)
+      let info = await fetchVersion(host, port)
+      if elapsed > 2.seconds:
+        warn "chrome boot slow", elapsed = elapsed, attempts = attempt
+      return info
     except CancelledError as e: raise e
     except ChromeError as e:
       lastErr = e.msg
     await sleepAsync(delay)
     if delay < 500.milliseconds: delay = delay * 2
+  let elapsed = Moment.now() - started
+  error "chrome boot timeout", elapsed = elapsed, lastErr = lastErr,
+        attempts = attempt
   fail("timed out waiting for chrome debugger endpoint" &
        (if lastErr.len > 0: " (last error: " & lastErr & ")" else: ""))
 
@@ -305,6 +321,8 @@ proc launch*(opts = initLaunchOptions()): Future[ChromeProcess] {.
     if url.isNil or url.kind != JString:
       fail("/json/version: missing webSocketDebuggerUrl")
     result.wsUrl = rewriteAuthority(url.getStr(), opts.host, opts.port)
+    info "chrome spawned", pid = process.pid, port = opts.port,
+         wsUrl = result.wsUrl
   except ChromeError as e:
     tearDownAndRaise(e)
   except CancelledError as e:
@@ -328,6 +346,9 @@ proc terminate*(p: ChromeProcess; grace = 3.seconds): Future[void] {.
   ## safe to call from a ``finally`` block; nothing here re-raises
   ## beyond cancellation.
   if p.handle.isNil: return
+  let pid = p.handle.pid
+  debug "terminating chrome", pid = pid
+  var forced = false
 
   when defined(posix):
     p.signalGroup(SIGTERM)
@@ -338,6 +359,8 @@ proc terminate*(p: ChromeProcess; grace = 3.seconds): Future[void] {.
   try:
     discard await p.handle.waitForExit().wait(grace)
   except AsyncTimeoutError:
+    forced = true
+    warn "chrome killed forcibly", pid = pid, grace = grace
     when defined(posix):
       p.signalGroup(SIGKILL)
     else:
@@ -364,3 +387,6 @@ proc terminate*(p: ChromeProcess; grace = 3.seconds): Future[void] {.
     try: removeDir(p.userDataDir)
     except CatchableError: discard
     p.userDataDir = ""
+
+  if not forced:
+    debug "chrome terminated", pid = pid

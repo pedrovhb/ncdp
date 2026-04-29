@@ -8,6 +8,7 @@ srcDir        = "src"
 # Dependencies
 requires "nim >= 2.2.8"
 requires "chronos >= 4.2.2"
+requires "chronicles >= 0.12.2"
 # nws_client is consumed via a path switch in config.nims (see /app/nws_client).
 
 task test, "Run the test suite":

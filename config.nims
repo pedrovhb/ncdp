@@ -11,3 +11,12 @@ switch("mm", "orc")
 # Strict-by-default style: keep warnings loud during development.
 switch("warning", "UnusedImport:on")
 switch("hint", "Processing:off")
+
+# chronicles: structured logging. Sink is plain text to stderr (keeps stdout
+# clean for example output). Log level is DEBUG in dev builds, INFO in
+# release — set per-binary via -d:release.
+switch("define", "chronicles_sinks=textlines[stderr,nocolors]")
+when defined(release):
+  switch("define", "chronicles_log_level=INFO")
+else:
+  switch("define", "chronicles_log_level=DEBUG")
