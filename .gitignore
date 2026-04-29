@@ -13,3 +13,5 @@ examples/gen/ex_02_call_schema_getDomains
 # Built test binaries
 tests/tpdl_parser
 tests/ttransport
+tests/tnames
+tests/tnames_corpus
