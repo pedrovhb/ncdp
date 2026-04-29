@@ -14,3 +14,5 @@ requires "chronicles >= 0.12.2"
 task test, "Run the test suite":
   exec "nim c -r --hints:off tests/tpdl_parser.nim"
   exec "nim c -r --hints:off tests/ttransport.nim"
+  exec "nim c -r --hints:off tests/tnames.nim"
+  exec "nim c -r --hints:off tests/tnames_corpus.nim"
