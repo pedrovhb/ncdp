@@ -15,3 +15,5 @@ tests/tpdl_parser
 tests/ttransport
 tests/tnames
 tests/tnames_corpus
+tests/temit
+tests/temit_compile

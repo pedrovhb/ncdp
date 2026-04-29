@@ -16,3 +16,5 @@ task test, "Run the test suite":
   exec "nim c -r --hints:off tests/ttransport.nim"
   exec "nim c -r --hints:off tests/tnames.nim"
   exec "nim c -r --hints:off tests/tnames_corpus.nim"
+  exec "nim c -r --hints:off tests/temit.nim"
+  exec "nim c -r --hints:off tests/temit_compile.nim"
