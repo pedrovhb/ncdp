@@ -79,6 +79,7 @@ type
     typeDecl: string
     wireConst: string
     hooks: string
+    deprecated: bool
 
   EmitCtx = ref object
     ## Per-domain emission state used while walking PDL types and
@@ -168,8 +169,7 @@ proc renderEnumBlock(nimType: string;
   ## have `reset-card`) would collide in the shared types module.
   ## See `/references/Nim/doc/manual.md:1318` on `pure`.
   result.nimType = nimType
-  let extras =
-    if deprecated: @["pure"] else: @["pure"]
+  result.deprecated = deprecated
   # Manually compose the pragma; `pragmas()` doesn't take a list of
   # always-on pragmas. Order: deprecated first if present, then pure.
   var pragParts: seq[string]
@@ -253,44 +253,61 @@ proc emitProperty(ctx: EmitCtx; p: PdlProperty; ownerNimType: string): string =
   if p.doc.len > 0:
     result.add renderDoc(p.doc, 6)
 
-proc emitObject(ctx: EmitCtx; o: PdlObjectDecl): string =
-  let nimType = typeName(ctx.domain.name, o.name)
-  let dep = o.deprecated or ctx.domain.deprecated
-  result = "  " & nimType & "*" & pragmas(dep) & " = ref object\n"
-  if o.doc.len > 0:
-    result.add renderDoc(o.doc, 4)
-  for p in o.properties:
-    result.add ctx.emitProperty(p, nimType)
+type
+  TypeChunk = object
+    ## A single type declaration plus a deprecation flag. The
+    ## assembler in ``emitTypesModule`` groups consecutive non-
+    ## deprecated chunks into one ``type`` block and emits each
+    ## deprecated chunk in its own ``{.push warning[Deprecated]: off.}``
+    ## bracket so deprecated *uses* of deprecated types (a deprecated
+    ## field referencing another deprecated type, etc.) don't trip
+    ## the consumer with a Nim warning.
+    text: string
+    deprecated: bool
 
-proc emitAlias(ctx: EmitCtx; a: PdlAliasDecl): string =
+proc emitObject(ctx: EmitCtx; o: PdlObjectDecl): TypeChunk =
+  let nimType = typeName(ctx.domain.name, o.name)
+  result.deprecated = o.deprecated or ctx.domain.deprecated
+  result.text = "  " & nimType & "*" & pragmas(result.deprecated) &
+                " = ref object\n"
+  if o.doc.len > 0:
+    result.text.add renderDoc(o.doc, 4)
+  for p in o.properties:
+    result.text.add ctx.emitProperty(p, nimType)
+
+proc emitAlias(ctx: EmitCtx; a: PdlAliasDecl): TypeChunk =
   let nimType = typeName(ctx.domain.name, a.name)
   let base = ctx.emitType(a.base)
-  let dep = a.deprecated or ctx.domain.deprecated
-  result = "  " & nimType & "*" & pragmas(dep) & " = " & base & "\n"
+  result.deprecated = a.deprecated or ctx.domain.deprecated
+  result.text = "  " & nimType & "*" & pragmas(result.deprecated) &
+                " = " & base & "\n"
   if a.doc.len > 0:
-    result.add renderDoc(a.doc, 4)
+    result.text.add renderDoc(a.doc, 4)
 
 # --------------------------------------------------- result/params types --
 
-proc emitResultType(ctx: EmitCtx; cmd: PdlCommand): string =
-  if cmd.returns.len == 0: return ""
+proc emitResultType(ctx: EmitCtx; cmd: PdlCommand): TypeChunk =
+  if cmd.returns.len == 0: return TypeChunk()
   let nimType = resultTypeName(ctx.domain.name, cmd.name)
-  let dep = cmd.deprecated or ctx.domain.deprecated
-  result = "  " & nimType & "*" & pragmas(dep) & " = ref object\n"
-  result.add "    ## Result of `" & ctx.domain.name & "." & cmd.name & "`.\n"
+  result.deprecated = cmd.deprecated or ctx.domain.deprecated
+  result.text = "  " & nimType & "*" & pragmas(result.deprecated) &
+                " = ref object\n"
+  result.text.add "    ## Result of `" & ctx.domain.name & "." &
+                  cmd.name & "`.\n"
   for p in cmd.returns:
-    result.add ctx.emitProperty(p, nimType)
+    result.text.add ctx.emitProperty(p, nimType)
 
-proc emitEventParamsType(ctx: EmitCtx; ev: PdlEvent): string =
+proc emitEventParamsType(ctx: EmitCtx; ev: PdlEvent): TypeChunk =
   let nimType = eventParamsTypeName(ctx.domain.name, ev.name)
-  let dep = ev.deprecated or ctx.domain.deprecated
-  result = "  " & nimType & "*" & pragmas(dep) & " = ref object\n"
+  result.deprecated = ev.deprecated or ctx.domain.deprecated
+  result.text = "  " & nimType & "*" & pragmas(result.deprecated) &
+                " = ref object\n"
   if ev.doc.len > 0:
-    result.add renderDoc(ev.doc, 4)
+    result.text.add renderDoc(ev.doc, 4)
   if ev.parameters.len == 0 and ev.doc.len == 0:
-    result.add "    ## (no parameters)\n"
+    result.text.add "    ## (no parameters)\n"
   for p in ev.parameters:
-    result.add ctx.emitProperty(p, nimType)
+    result.text.add ctx.emitProperty(p, nimType)
 
 # --------------------------------------------------------- commands -------
 
@@ -408,10 +425,10 @@ proc emitEventRegistration(ctx: EmitCtx; ev: PdlEvent): string =
 type
   DomainTypes = object
     ## All type-shaped output produced by walking one domain. The
-    ## types-module emitter concatenates these across every domain.
+    ## types-module emitter concatenates these across every domain
+    ## and groups by deprecation flag at assembly time.
     enums: seq[EnumBlock]
-    objectsAndAliases: string  # `  Foo* = ref object\n    ...\n`
-    resultsAndParams: string    # command result + event params decls
+    chunks: seq[TypeChunk]   # objects, aliases, *Result, *Params
 
 proc collectDomainTypes(d: PdlDomain; registry: NameRegistry): DomainTypes =
   let ctx = EmitCtx(domain: d, registry: registry,
@@ -424,9 +441,9 @@ proc collectDomainTypes(d: PdlDomain; registry: NameRegistry): DomainTypes =
       result.enums.add registerEnum(
         ctx, typeName(d.name, e.name), e.members, dep, e.doc)
     elif t of PdlObjectDecl:
-      result.objectsAndAliases.add ctx.emitObject(PdlObjectDecl(t))
+      result.chunks.add ctx.emitObject(PdlObjectDecl(t))
     elif t of PdlAliasDecl:
-      result.objectsAndAliases.add ctx.emitAlias(PdlAliasDecl(t))
+      result.chunks.add ctx.emitAlias(PdlAliasDecl(t))
 
   for c in d.commands:
     # Walk command parameters too — they can carry inline enums that
@@ -437,10 +454,11 @@ proc collectDomainTypes(d: PdlDomain; registry: NameRegistry): DomainTypes =
     let owner = toPascal(d.name) & toPascal(c.name) & "Params"
     for p in c.parameters:
       discard ctx.emitProperty(p, owner)
-    result.resultsAndParams.add ctx.emitResultType(c)
+    let r = ctx.emitResultType(c)
+    if r.text.len > 0: result.chunks.add r
 
   for ev in d.events:
-    result.resultsAndParams.add ctx.emitEventParamsType(ev)
+    result.chunks.add ctx.emitEventParamsType(ev)
 
   # Inline enums lifted during property walks land in ctx.lifted.
   for blk in ctx.lifted:
@@ -461,33 +479,42 @@ proc emitTypesModule*(domains: seq[PdlDomain];
   result.add "\n"
 
   var allEnums: seq[EnumBlock]
-  var objects = ""
-  var resultsAndParams = ""
+  var allChunks: seq[TypeChunk]
   for d in domains:
     if isHandWritten(d.name): continue
     let dt = collectDomainTypes(d, registry)
     for e in dt.enums: allEnums.add e
-    objects.add dt.objectsAndAliases
-    resultsAndParams.add dt.resultsAndParams
+    for c in dt.chunks: allChunks.add c
 
-  if allEnums.len > 0 or objects.len > 0 or resultsAndParams.len > 0:
+  # The entire types module is generated code referencing other
+  # generated code. Deprecated types frequently reference each other
+  # (a deprecated event params type whose field is itself a
+  # deprecated type, for example), and Nim warns at every such use.
+  # We can't split into separate `type` blocks to bracket
+  # deprecation, because Nim only allows mutual type references
+  # within ONE `type` block. So: silence Deprecated warnings for the
+  # whole types module. Consumer code (per-domain modules and user
+  # code) still gets warnings on deprecated symbols they use
+  # directly — only intra-types-module noise is suppressed.
+  if allEnums.len > 0 or allChunks.len > 0:
+    result.add "{.push warning[Deprecated]: off.}\n\n"
     result.add "type\n"
     for e in allEnums:
       result.add e.typeDecl
       result.add "\n"
-    if objects.len > 0:
-      result.add objects
-    if resultsAndParams.len > 0:
-      result.add resultsAndParams
+    for c in allChunks:
+      result.add c.text
     result.add "\n"
 
-  if allEnums.len > 0:
-    result.add "const\n"
-    for e in allEnums:
-      result.add e.wireConst
-    result.add "\n"
-    for e in allEnums:
-      result.add e.hooks
+    if allEnums.len > 0:
+      result.add "const\n"
+      for e in allEnums:
+        result.add e.wireConst
+      result.add "\n"
+      for e in allEnums:
+        result.add e.hooks
+
+    result.add "{.pop.}\n"
 
 proc emitDomainModule*(d: PdlDomain; registry: NameRegistry): string =
   ## Per-domain commands + event-registration module. Imports the
@@ -515,7 +542,13 @@ proc emitDomainModule*(d: PdlDomain; registry: NameRegistry): string =
   result.add "\n"
 
   for c in d.commands:
+    let dep = c.deprecated or d.deprecated
+    if dep: result.add "{.push warning[Deprecated]: off.}\n"
     result.add ctx.emitCommand(c)
+    if dep: result.add "{.pop.}\n"
 
   for ev in d.events:
+    let dep = ev.deprecated or d.deprecated
+    if dep: result.add "{.push warning[Deprecated]: off.}\n"
     result.add ctx.emitEventRegistration(ev)
+    if dep: result.add "{.pop.}\n"
