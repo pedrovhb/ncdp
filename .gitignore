@@ -17,3 +17,5 @@ tests/tnames
 tests/tnames_corpus
 tests/temit
 tests/temit_compile
+src/gen/cdp/driver
+src/cdp/gen/

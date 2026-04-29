@@ -17,7 +17,7 @@ import std/[exitprocs, json, os, strformat, strutils, sysrand]
 import chronos
 import chronos/asyncproc
 import chronos/apps/http/httpclient
-import ./log
+import ./logging
 
 when defined(posix):
   import std/posix

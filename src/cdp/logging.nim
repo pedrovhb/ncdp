@@ -6,7 +6,7 @@
 ##
 ## Usage::
 ##
-##   import ./log
+##   import ./logging
 ##   logScope: topics = TopicTransport
 ##   info "transport connected", url = wsUrl
 ##

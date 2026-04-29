@@ -115,10 +115,22 @@ proc emitPrimitive(t: PdlPrimitiveType): string =
   of ppBinary:  "Binary"
   of ppObject:  "JsonNode"
 
+const HandWrittenDomains* = ["Schema", "SystemInfo"]
+  ## Domains whose modules live at `src/cdp/<domain>.nim` rather than
+  ## the generated `src/cdp/gen/<domain>.nim`. Cross-domain refs to
+  ## these resolve one directory up.
+
+proc isHandWritten(name: string): bool =
+  for h in HandWrittenDomains:
+    if h == name: return true
+  false
+
 proc emitRef(ctx: EmitCtx; t: PdlRefType): string =
   if t.domain.isSome and t.domain.get != ctx.domain.name:
     let other = t.domain.get
-    ctx.imports.incl moduleFileName(other)
+    let path = if isHandWritten(other): "../" & moduleFileName(other)
+               else: "./" & moduleFileName(other)
+    ctx.imports.incl path
     return moduleFileName(other) & "." & typeName(other, t.name)
   typeName(ctx.domain.name, t.name)
 
@@ -274,31 +286,53 @@ proc emitCommand(ctx: EmitCtx; cmd: PdlCommand): string =
   if cmd.doc.len > 0:
     result.add renderDoc(cmd.doc, 2)
 
+  # Wrap the params-building, send, and decode in a single block so
+  # any `Exception` from `toJson`/`jsonTo` (which jsonutils' inferred
+  # raises let through) becomes a `CDPError`. Without this, the proc's
+  # async raises whitelist would be violated.
   if cmd.parameters.len == 0:
     result.add "  let raw = await client.sendCommand(\"" &
                domainName & "." & pName & "\")\n"
+    if retType == "void":
+      result.add "  discard raw\n"
+    else:
+      result.add "  try:\n"
+      result.add "    {.cast(gcsafe).}:\n"
+      result.add "      result = jsonTo(raw, " & retType & ")\n"
+      result.add "  except CDPError as e: raise e\n"
+      result.add "  except CDPTransportError as e: raise e\n"
+      result.add "  except CancelledError as e: raise e\n"
+      result.add "  except CatchableError as e:\n"
+      result.add "    raise newException(CDPError,\n"
+      result.add "      \"" & domainName & "." & pName &
+                 ": malformed response: \" & e.msg)\n"
   else:
-    result.add "  let params = newJObject()\n"
+    result.add "  var raw: JsonNode\n"
+    result.add "  try:\n"
+    result.add "    let params = newJObject()\n"
+    result.add "    {.cast(gcsafe).}:\n"
     for p in cmd.parameters:
       let f = mangleField(p.name)
       let access = if f.needsBackticks: "`" & f.nim & "`" else: f.nim
       if p.optional:
-        result.add "  if " & access & ".isSome:\n"
-        result.add "    params[\"" & p.name & "\"] = toJson(" & access & ".get)\n"
+        result.add "      if " & access & ".isSome:\n"
+        result.add "        params[\"" & p.name & "\"] = toJson(" & access & ".get)\n"
       else:
-        result.add "  params[\"" & p.name & "\"] = toJson(" & access & ")\n"
-    result.add "  let raw = await client.sendCommand(\"" &
+        result.add "      params[\"" & p.name & "\"] = toJson(" & access & ")\n"
+    result.add "    raw = await client.sendCommand(\"" &
                domainName & "." & pName & "\", params)\n"
-
-  if retType == "void":
-    result.add "  discard raw\n"
-  else:
-    result.add "  try:\n"
-    result.add "    result = jsonTo(raw, " & retType & ")\n"
+    if retType != "void":
+      result.add "    {.cast(gcsafe).}:\n"
+      result.add "      result = jsonTo(raw, " & retType & ")\n"
+    result.add "  except CDPError as e: raise e\n"
+    result.add "  except CDPTransportError as e: raise e\n"
+    result.add "  except CancelledError as e: raise e\n"
     result.add "  except CatchableError as e:\n"
     result.add "    raise newException(CDPError,\n"
     result.add "      \"" & domainName & "." & pName &
-               ": malformed response: \" & e.msg)\n"
+               ": marshal failed: \" & e.msg)\n"
+    if retType == "void":
+      result.add "  discard raw\n"
   result.add "\n"
 
 # --------------------------------------------------------- events ---------
@@ -327,10 +361,15 @@ proc emitEventRegistration(ctx: EmitCtx; ev: PdlEvent): string =
     result.add renderDoc(ev.doc, 2)
   result.add "  client.addEventListener(\"" & domainName & "." & ev.name &
              "\", proc(params: JsonNode) {.gcsafe, raises: [].} =\n"
-  result.add "    var typed: " & paramsType & "\n"
-  result.add "    try: typed = jsonTo(params, " & paramsType & ")\n"
-  result.add "    except CatchableError: return\n"
-  result.add "    cb(typed))\n\n"
+  # `jsonTo` is transitively GC-unsafe because the JsonNode tree owns
+  # heap state that the compiler can't prove is single-threaded. The
+  # cast is sound here because the transport invokes listeners only on
+  # its own dispatcher thread.
+  result.add "    {.cast(gcsafe).}:\n"
+  result.add "      var typed: " & paramsType & "\n"
+  result.add "      try: typed = jsonTo(params, " & paramsType & ")\n"
+  result.add "      except Exception: return\n"
+  result.add "      cb(typed))\n\n"
 
 # --------------------------------------------------------- module --------
 
@@ -386,13 +425,13 @@ proc emitDomain*(d: PdlDomain; registry: NameRegistry): string =
   result = moduleHeader(d)
   result.add "import chronos\n"
   result.add "import std/[json, jsonutils, options]\n"
-  result.add "import ./jsonhooks\n"
-  result.add "import ./transport\n"
+  result.add "import ../jsonhooks\n"
+  result.add "import ../transport\n"
   var sortedImports = newSeq[string]()
   for m in ctx.imports: sortedImports.add m
   sortedImports.sort()
   for m in sortedImports:
-    result.add "import ./" & m & "\n"
+    result.add "import " & m & "\n"
   result.add "\n"
 
   let allEnums = topEnums & ctx.lifted

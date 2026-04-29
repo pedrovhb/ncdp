@@ -72,8 +72,8 @@ suite "emit — Schema":
     let d = loadDomain("Schema")
     let txt = emitDomain(d, reg)
     check "import chronos" in txt
-    check "import ./jsonhooks" in txt
-    check "import ./transport" in txt
+    check "import ../jsonhooks" in txt
+    check "import ../transport" in txt
 
   test "emitted output mentions every PDL field":
     let reg = newRegistry()

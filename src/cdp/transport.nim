@@ -16,7 +16,7 @@ import std/[json, tables]
 import chronos
 import nws_client
 import ./jsonhooks
-import ./log
+import ./logging
 
 logScope:
   topics = "transport"
