@@ -17,6 +17,7 @@ switch("hint", "Processing:off")
 # release — set per-binary via -d:release.
 switch("define", "chronicles_sinks=textlines[stderr,nocolors]")
 when defined(release):
-  switch("define", "chronicles_log_level=INFO")
+  switch("define", "chronicles_log_level=WARN")
 else:
-  switch("define", "chronicles_log_level=DEBUG")
+  # switch("define", "chronicles_log_level=DEBUG")
+  switch("define", "chronicles_log_level=WARN")

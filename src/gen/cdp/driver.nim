@@ -11,7 +11,7 @@
 ## The driver is idempotent: a file is only rewritten when its
 ## emitted content differs from what's already on disk.
 
-import std/[algorithm, os, sets, strutils, tables]
+import std/[algorithm, os, sets, tables]
 import ../pdl/[ast, parser]
 import ./[emit, names]
 
@@ -77,6 +77,22 @@ proc loadAllDomains(pdlRoot: string): seq[PdlDomain] =
   for d in f.domains: result.add d
   for d in g.domains: result.add d
 
+proc dependencyClosure(domains: seq[PdlDomain];
+                       roots: HashSet[string]): HashSet[string] =
+  ## Domains whose types are needed to compile modules for ``roots``.
+  ## ``--only=Page`` still needs Debugger/DOM/IO/Network/Runtime types,
+  ## because generated references are bare names in the shared types module.
+  result = roots
+  var changed = true
+  while changed:
+    changed = false
+    for d in domains:
+      if d.name notin result: continue
+      for dep in d.dependsOn:
+        if dep notin result:
+          result.incl dep
+          changed = true
+
 proc isReserved(name: string): bool =
   for r in ReservedDomains:
     if r == name: return true
@@ -95,6 +111,8 @@ proc generate*(opts: GenOptions): GenReport =
     var s = initHashSet[string]()
     for n in opts.onlyDomains: s.incl n
     s
+  let typeDomains =
+    if only.len == 0: only else: dependencyClosure(domains, only)
 
   if not opts.dryRun: createDir(opts.outDir)
 
@@ -105,7 +123,7 @@ proc generate*(opts: GenOptions): GenReport =
   var emitDomains: seq[PdlDomain]
   for d in domains:
     if isReserved(d.name): continue
-    if only.len > 0 and d.name notin only: continue
+    if typeDomains.len > 0 and d.name notin typeDomains: continue
     emitDomains.add d
   let typesText = emitTypesModule(emitDomains, registry)
   if opts.dryRun:
@@ -134,7 +152,7 @@ proc generate*(opts: GenOptions): GenReport =
 # --------------------------------------------------------------- CLI ------
 
 when isMainModule:
-  import std/parseopt
+  import std/[parseopt, strutils]
 
   proc usage() =
     echo "Usage: cdp_gen [--pdl=<dir>] [--out=<dir>] [--dry-run] [--only=Domain,Domain]"

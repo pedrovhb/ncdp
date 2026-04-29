@@ -13,7 +13,7 @@
 ## `terminate`: SIGTERM with a configurable grace period, falling back
 ## to SIGKILL, then deleting the temporary user-data dir.
 
-import std/[exitprocs, json, os, strformat, strutils, sysrand]
+import std/[exitprocs, json, os, strformat, strutils, sysrand, uri]
 import chronos
 import chronos/asyncproc
 import chronos/apps/http/httpclient
@@ -92,6 +92,14 @@ proc registerExitHandler() =
     {.cast(gcsafe).}:
       addExitProc(killOnExit)
     exitHandlerRegistered = true
+
+proc unregisterLiveProcess(p: ChromeProcess) =
+  ## Remove ``p`` from the exit-handler list after explicit cleanup.
+  ## Linear scan is fine — callers normally have one or two browsers.
+  for i in 0 ..< liveProcesses.len:
+    if liveProcesses[i] == p:
+      liveProcesses.del(i)
+      break
 
 # -------------------------------------------------------- defaults ----------
 
@@ -297,7 +305,8 @@ proc newTab*(host: string; port: int;
   ## websocket) so a CDPClient connected to the returned URL can
   ## issue `Page.*`, `Runtime.*`, `DOM.*` etc. without needing
   ## session routing on top of the browser-level websocket.
-  let info = await fetchWithMethod(host, port, "/json/new?" & url, MethodPut)
+  let info = await fetchWithMethod(host, port, "/json/new?" & encodeUrl(url),
+                                   MethodPut)
   let wsUrl = info.getOrDefault("webSocketDebuggerUrl")
   if wsUrl.isNil or wsUrl.kind != JString:
     fail("/json/new: missing webSocketDebuggerUrl")
@@ -366,9 +375,12 @@ proc launch*(opts = initLaunchOptions()): Future[ChromeProcess] {.
     except CatchableError: discard
     try: await process.closeWait()
     except CatchableError: discard
+    unregisterLiveProcess(result)
     if result.userDataDir.len > 0:
       try: removeDir(result.userDataDir)
       except CatchableError: discard
+      result.userDataDir = ""
+    result.handle = nil
     raise err
   try:
     let info = await waitForBoot(opts.host, opts.port, opts.bootTimeout)
@@ -430,13 +442,7 @@ proc terminate*(p: ChromeProcess; grace = 3.seconds): Future[void] {.
   try: await p.handle.closeWait()
   except CatchableError: discard
 
-  # Drop from the exit-handler list now that we've cleaned up
-  # explicitly. (Linear scan is fine — we expect a handful of live
-  # processes at most.)
-  for i in 0 ..< liveProcesses.len:
-    if liveProcesses[i] == p:
-      liveProcesses.del(i)
-      break
+  unregisterLiveProcess(p)
 
   if p.userDataDir.len > 0:
     try: removeDir(p.userDataDir)

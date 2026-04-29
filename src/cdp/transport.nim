@@ -243,6 +243,11 @@ proc sendCommand*(c: CDPClient; methodName: string;
   let started = Moment.now()
   try:
     await c.ws.send($frame)
+  except CancelledError as e:
+    {.cast(gcsafe).}:
+      {.cast(raises: []).}:
+        c.pending.del(id)
+    raise e
   except CatchableError as e:
     {.cast(gcsafe).}:
       {.cast(raises: []).}:
@@ -260,6 +265,9 @@ proc sendCommand*(c: CDPClient; methodName: string;
           err = e.msg, latency = Moment.now() - started
     raise e
   except CancelledError as e:
+    {.cast(gcsafe).}:
+      {.cast(raises: []).}:
+        c.pending.del(id)
     raise e
   except CatchableError as e:
     raise newException(CDPTransportError, "response failed: " & e.msg)
