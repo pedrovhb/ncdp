@@ -25,6 +25,7 @@ type
     url: string
     depth: int
     boxes: bool
+    root: AriaSnapshotRoot
     interactive: bool
 
   ConsoleBuffer = ref object
@@ -91,7 +92,8 @@ proc sampleUrl(): string =
 
 proc parseArgs(): Args =
   result = Args(mode: mLaunch, host: "127.0.0.1", port: 9222,
-                url: sampleUrl(), depth: 0, boxes: false)
+                url: sampleUrl(), depth: 0, boxes: false,
+                root: AriaSnapshotRoot.Readability)
   var p = initOptParser()
   while true:
     p.next()
@@ -107,10 +109,12 @@ proc parseArgs(): Args =
       of "url": result.url = p.val
       of "depth": result.depth = parseInt(p.val)
       of "boxes": result.boxes = true
+      of "full-page", "full": result.root = AriaSnapshotRoot.FullPage
       of "interactive", "i": result.interactive = true
       of "help", "h":
         echo "usage: ex_03 [--launch|--discover] [--host=H] [--port=N] " &
-             "[--url=URL] [--depth=N] [--boxes] [--interactive]"
+             "[--url=URL] [--depth=N] [--boxes] [--full-page] " &
+             "[--interactive]"
         quit 0
       else: quit "unknown option: --" & p.key
     of cmdArgument: quit "unexpected positional: " & p.key
@@ -142,7 +146,8 @@ proc printSnapshot(page: Page; args: Args) {.
     let title = if titleNode.isNil or titleNode.kind != JString: "" else: titleNode.getStr()
     echo &"url:   {displayUrl(url)}"
     echo &"title: {title}"
-  echo await page.ariaSnapshot(depth = args.depth, boxes = args.boxes)
+  echo await page.ariaSnapshot(initAriaOptions(depth = args.depth,
+    boxes = args.boxes, root = args.root))
 
 proc printInteractiveHelp() =
   echo ""
@@ -247,7 +252,8 @@ proc actionKinds(item: AriaActionRef): string =
 proc printActionRefs(page: Page; args: Args) {.
     async: (raises: [CatchableError]).} =
   let refs = await page.actionRefs(
-    initAriaOptions(depth = args.depth, boxes = args.boxes))
+    initAriaOptions(depth = args.depth, boxes = args.boxes,
+                    root = args.root))
   if refs.len == 0:
     echo "(no actionable refs)"
     return
@@ -264,7 +270,8 @@ proc printActionRefs(page: Page; args: Args) {.
 proc printLinks(page: Page; args: Args) {.
     async: (raises: [CatchableError]).} =
   let links = await page.links(
-    initAriaOptions(depth = args.depth, boxes = args.boxes))
+    initAriaOptions(depth = args.depth, boxes = args.boxes,
+                    root = args.root))
   if links.len == 0:
     echo "(no links)"
     return

@@ -102,7 +102,7 @@ The top-level numbered examples are the recommended, latest-and-greatest path:
 
 - `examples/ex_01_browser_get_version.nim`: launch/discover Chrome and call `Browser.getVersion` through the high-level browser facade.
 - `examples/ex_02_page_goto_eval_screenshot.nim`: open a page, navigate, evaluate JavaScript, and capture a screenshot through the Page facade.
-- `examples/ex_03_aria_snapshot.nim`: print an AI-friendly ARIA tree; `--interactive` starts a stdin REPL that can `click`, `fill`, `set`, `select`, `press`, `goto`, and `snapshot` using ARIA refs.
+- `examples/ex_03_aria_snapshot.nim`: print an AI-friendly ARIA tree; snapshots are Readability-reduced by default, and `--full-page` restores the full-page tree. `--interactive` starts a stdin REPL that can `click`, `fill`, `set`, `select`, `press`, `goto`, and `snapshot` using ARIA refs.
 
 Raw generated-CDP examples live under `examples/raw/` and keep their numbering:
 
@@ -117,8 +117,14 @@ Raw generated-CDP examples live under `examples/raw/` and keep their numbering:
 **ARIA Snapshot Example**
 ```sh
 nim c -d:ssl -r examples/ex_03_aria_snapshot.nim -- --url=https://example.com
+nim c -d:ssl -r examples/ex_03_aria_snapshot.nim -- --url=https://example.com --full-page
 nim c -d:ssl -r examples/ex_03_aria_snapshot.nim -- --url=https://example.com --interactive
 ```
+
+Snapshots run the page through Mozilla Readability first so article pages omit
+common navigation, sidebar, footer, and ad boilerplate. Use `--full-page` for
+browser automation workflows that need controls outside the detected article,
+or for pages where Readability falls back too aggressively.
 
 Interactive commands:
 

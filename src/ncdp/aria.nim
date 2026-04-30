@@ -6,8 +6,13 @@ import cdp/gen/input as cdpInput
 import ./browser
 
 const AriaHelperSource = staticRead("../../examples/ariaSnapshot.js")
+const ReadabilitySource = staticRead("../../resources/readability/Readability.js")
 
 type
+  AriaSnapshotRoot* {.pure.} = enum
+    ## Source tree used for an ARIA snapshot.
+    Readability, FullPage
+
   AriaActionKind* {.pure.} = enum
     ## Action supported by an ARIA ref.
     Click, Fill, Set, Select, Check, Uncheck
@@ -43,6 +48,7 @@ type
     depth*: int
     boxes*: bool
     refPrefix*: string
+    root*: AriaSnapshotRoot
 
   AriaActionRef* = object
     ## A ref from the latest ARIA snapshot classified by supported actions.
@@ -76,10 +82,11 @@ type
     text: string
     modifiers: int
 
-proc initAriaOptions*(depth = 0; boxes = false;
-                      refPrefix = "n"): AriaOptions =
+proc initAriaOptions*(depth = 0; boxes = false; refPrefix = "n";
+                      root = AriaSnapshotRoot.Readability): AriaOptions =
   ## Build default ARIA snapshot options.
-  result = AriaOptions(depth: depth, boxes: boxes, refPrefix: refPrefix)
+  result = AriaOptions(depth: depth, boxes: boxes, refPrefix: refPrefix,
+                       root: root)
 
 proc initAriaSelectBy*(valueOrLabel = ""; value = ""; label = "";
                        index = none(int)): AriaSelectBy =
@@ -168,12 +175,24 @@ proc ariaSnapshotHelperSource(): string =
   if exportAt >= 0:
     result.setLen(exportAt)
 
+proc readabilitySource(): string =
+  result = ReadabilitySource
+  let exportAt = result.rfind("\nif (typeof module === \"object\")")
+  if exportAt >= 0:
+    result.setLen(exportAt)
+
+proc ariaRootName(root: AriaSnapshotRoot): string =
+  case root
+  of AriaSnapshotRoot.Readability: "readability"
+  of AriaSnapshotRoot.FullPage: "fullPage"
+
 proc ariaOptionsLiteral(opts: AriaOptions): string =
   let refPrefix = if opts.refPrefix.len == 0: "n" else: opts.refPrefix
   let node = %*{
     "mode": "ai",
     "refPrefix": refPrefix,
     "boxes": opts.boxes,
+    "root": ariaRootName(opts.root),
   }
   if opts.depth > 0:
     node["depth"] = newJInt(opts.depth)
@@ -181,12 +200,16 @@ proc ariaOptionsLiteral(opts: AriaOptions): string =
 
 proc installAriaHelperExpression(): string =
   let helper = ariaSnapshotHelperSource()
+  let readability = readabilitySource()
   """
 (() => {
-  if (window.__ncdpAria?.elementPoint && window.__ncdpAria?.focusForFill)
+  if (window.__ncdpAria?.version === 2 && window.__ncdpAria?.elementPoint &&
+      window.__ncdpAria?.focusForFill)
     return "ok";
+""" & readability & """
 """ & helper & """
   const root = () => document.body || document.documentElement;
+  const originAttr = "data-ncdp-readability-origin";
   const textInputTypes = new Set([
     "", "text", "search", "url", "tel", "email", "password",
   ]);
@@ -198,12 +221,147 @@ proc installAriaHelperExpression(): string =
     "button", "link", "checkbox", "radio", "switch", "menuitem",
     "menuitemcheckbox", "menuitemradio", "option", "tab", "treeitem",
   ]);
-  const defaultOptions = () => ({ mode: "ai", refPrefix: "n" });
+  const defaultOptions = () => ({ mode: "ai", refPrefix: "n", root: "readability" });
+  const markCloneOrigins = (originalNode, clonedNode, originMap, nextId) => {
+    if (originalNode?.nodeType === Node.ELEMENT_NODE &&
+        clonedNode?.nodeType === Node.ELEMENT_NODE) {
+      const id = String(nextId.value++);
+      clonedNode.setAttribute(originAttr, id);
+      originMap.set(id, originalNode);
+    }
+    let originalChild = originalNode?.firstChild;
+    let clonedChild = clonedNode?.firstChild;
+    while (originalChild && clonedChild) {
+      markCloneOrigins(originalChild, clonedChild, originMap, nextId);
+      originalChild = originalChild.nextSibling;
+      clonedChild = clonedChild.nextSibling;
+    }
+  };
+  const visibleForSnapshot = element =>
+    !isElementHiddenForAria(element) || isElementVisible(element);
+  const liveReceivesPointerEvents = element => {
+    for (let e = element; e; e = parentElementOrShadowHost(e)) {
+      const style = getElementComputedStyle(e);
+      if (!style)
+        return true;
+      if (style.pointerEvents)
+        return style.pointerEvents !== "none";
+    }
+    return true;
+  };
+  const pruneInvisibleCloneOrigins = (clonedDoc, originMap) => {
+    const nodes = [...clonedDoc.querySelectorAll(`[${originAttr}]`)];
+    for (const node of nodes) {
+      const original = originMap.get(node.getAttribute(originAttr));
+      if (original && !visibleForSnapshot(original) && node.parentNode)
+        node.remove();
+    }
+  };
+  const hydrateImportedRefs = (rootElement, originMap) => {
+    for (const node of rootElement.querySelectorAll(`[${originAttr}]`)) {
+      const original = originMap.get(node.getAttribute(originAttr));
+      if (original?._ariaRef)
+        node._ariaRef = original._ariaRef;
+    }
+  };
+  const readabilityRoot = () => {
+    if (typeof Readability !== "function")
+      return null;
+    const clonedDoc = document.cloneNode(true);
+    const originMap = new Map();
+    markCloneOrigins(document, clonedDoc, originMap, { value: 1 });
+    pruneInvisibleCloneOrigins(clonedDoc, originMap);
+    try {
+      const article = new Readability(clonedDoc, { serializer: element => element }).parse();
+      if (!article?.content)
+        return null;
+      const container = document.createElement("div");
+      container.style.position = "absolute";
+      container.style.left = "0";
+      container.style.top = "0";
+      container.style.width = "100%";
+      container.style.zIndex = "-2147483648";
+      container.appendChild(document.importNode(article.content, true));
+      hydrateImportedRefs(container, originMap);
+      (document.body || document.documentElement).appendChild(container);
+      return {
+        root: container.firstElementChild || container,
+        originMap,
+        cleanup: () => container.remove(),
+      };
+    } catch (_) {
+      return null;
+    }
+  };
+  const snapshotSource = options => {
+    if ((options || defaultOptions()).root === "fullPage")
+      return { root: root(), originMap: null };
+    return readabilityRoot() || { root: root(), originMap: null };
+  };
+  const remapNodeElements = (ariaNode, originMap) => {
+    if (!ariaNode || typeof ariaNode === "string")
+      return;
+    const element = ariaNodeElement(ariaNode);
+    const originId = element?.getAttribute?.(originAttr);
+    const original = originId ? originMap.get(originId) : null;
+    if (original) {
+      setAriaNodeElement(ariaNode, original);
+      if (ariaNode.ref && (!computeBox(original).visible || !liveReceivesPointerEvents(original)))
+        delete ariaNode.ref;
+      if (ariaNode.ref)
+        original._ariaRef = { role: ariaNode.role, name: ariaNode.name, ref: ariaNode.ref };
+    }
+    for (const child of ariaNode.children || [])
+      remapNodeElements(child, originMap);
+  };
+  const remapSnapshotElements = (snapshot, originMap) => {
+    if (!originMap)
+      return;
+    remapNodeElements(snapshot.root, originMap);
+    const remapped = new Map();
+    const refs = new Map();
+    for (const [ref, element] of snapshot.elements || []) {
+      const originId = element?.getAttribute?.(originAttr);
+      const original = originId ? originMap.get(originId) : null;
+      if (original?.isConnected && computeBox(original).visible &&
+          liveReceivesPointerEvents(original)) {
+        remapped.set(ref, original);
+        refs.set(original, ref);
+      }
+    }
+    snapshot.elements = remapped;
+    snapshot.refs = refs;
+  };
+  const originalScopeElements = (rootElement, originMap) => {
+    const result = new Set();
+    if (!originMap)
+      return result;
+    const addOriginal = node => {
+      const originId = node?.getAttribute?.(originAttr);
+      const original = originId ? originMap.get(originId) : null;
+      if (original?.isConnected)
+        result.add(original);
+    };
+    addOriginal(rootElement);
+    for (const node of rootElement.querySelectorAll?.(`[${originAttr}]`) || [])
+      addOriginal(node);
+    return result;
+  };
   const refresh = options => {
     window.__ncdpAriaLastOptions = options || defaultOptions();
-    const snapshot = generateAriaTree(root(), window.__ncdpAriaLastOptions);
-    window.__ncdpAriaElements = snapshot.elements;
-    return snapshot;
+    const source = snapshotSource(window.__ncdpAriaLastOptions);
+    const scope = originalScopeElements(source.root, source.originMap);
+    try {
+      const snapshot = generateAriaTree(source.root, window.__ncdpAriaLastOptions);
+      remapSnapshotElements(snapshot, source.originMap);
+      window.__ncdpAriaElements = snapshot.elements;
+      window.__ncdpAriaRefs = snapshot.refs;
+      window.__ncdpAriaScope = scope;
+      window.__ncdpAriaReduced = !!source.originMap;
+      return snapshot;
+    } finally {
+      source.cleanup?.();
+    }
   };
   const elementForRef = ref => {
     const current = window.__ncdpAriaElements?.get(ref);
@@ -454,6 +612,7 @@ proc installAriaHelperExpression(): string =
     return { sample };
   };
   window.__ncdpAria = {
+    version: 2,
     snapshotText(options) {
       return renderAriaTree(refresh(options), window.__ncdpAriaLastOptions).text;
     },
@@ -487,11 +646,14 @@ proc installAriaHelperExpression(): string =
     },
     links(options) {
       refresh(options || window.__ncdpAriaLastOptions || defaultOptions());
-      const refs = reverseRefs();
+      const refs = window.__ncdpAriaRefs || reverseRefs();
+      const scope = window.__ncdpAriaReduced ? window.__ncdpAriaScope || new Set() : new Set();
       const seen = new Set();
       const rows = [];
       for (const element of document.querySelectorAll('a[href], [role="link"]')) {
         if (!element.isConnected || seen.has(element))
+          continue;
+        if (scope.size && !scope.has(element) && ![...scope].some(item => item.contains(element)))
           continue;
         seen.add(element);
         rows.push({
