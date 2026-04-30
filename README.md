@@ -1,5 +1,8 @@
 # ncdp
 
+> **Pre-alpha:** this library is not production-ready yet. APIs and
+> behavior may change without notice until the first stable release.
+
 Nim bindings for the Chrome DevTools Protocol (CDP).
 
 The project has three pieces:
@@ -13,8 +16,7 @@ Generated bindings use Chronos futures and map CDP optional fields to `Option[T]
 **Requirements**
 - Nim `>= 2.2.8`.
 - Chrome or Chromium on `PATH`, or `NCDP_CHROME=/path/to/chrome`.
-- `nws_client` available via the local path configured in `config.nims`.
-- On some NixOS systems, binaries that load OpenSSL need `LD_LIBRARY_PATH=/run/current-system/sw/share/nix-ld/lib`.
+- `nws_client`, installed by Nimble from its GitHub repository.
 
 **Quickstart**
 Generate the CDP domain bindings:
@@ -150,4 +152,4 @@ The generator writes ignored files under `src/cdp/gen/`:
 Type names are domain-prefixed in the shared type module, for example `Network.RequestId` becomes `NetworkRequestId`. Pure enums use qualified PascalCase members, for example `PageTransitionType.Link`.
 
 **Troubleshooting**
-See `docs/troubleshooting.md` for Chrome binary discovery, NixOS OpenSSL, generated-module setup, noisy Chrome stderr, CSP/evaluation notes, and port conflicts.
+See `docs/troubleshooting.md` for Chrome binary discovery, generated-module setup, noisy Chrome stderr, CSP/evaluation notes, and port conflicts.

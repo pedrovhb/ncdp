@@ -10,9 +10,6 @@
 ##   nim c -d:ssl -r examples/raw/ex_03_browser_via_codegen.nim
 ##   nim c -d:ssl -r examples/raw/ex_03_browser_via_codegen.nim -- --discover
 ##
-## Set ``LD_LIBRARY_PATH=/run/current-system/sw/share/nix-ld/lib`` if
-## OpenSSL doesn't load on NixOS.
-
 import std/[options, parseopt, strformat, strutils]
 import chronos
 import cdp/[chrome, transport]

@@ -9,7 +9,7 @@ srcDir        = "src"
 requires "nim >= 2.2.8"
 requires "chronos >= 4.2.2"
 requires "chronicles >= 0.12.2"
-# nws_client is consumed via a path switch in config.nims (see /app/nws_client).
+requires "https://github.com/pedrovhb/nws_client.git"
 
 task gen, "Regenerate CDP bindings from bundled PDL files":
   exec "nim c -r --hints:off src/gen/cdp/driver.nim"

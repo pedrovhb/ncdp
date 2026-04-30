@@ -23,9 +23,6 @@
 ##   nim c -d:ssl -r examples/raw/ex_04_navigate_eval_screenshot.nim -- --url=https://news.ycombinator.com
 ##   nim c -d:ssl -r examples/raw/ex_04_navigate_eval_screenshot.nim -- --discover
 ##
-## Set ``LD_LIBRARY_PATH=/run/current-system/sw/share/nix-ld/lib``
-## on NixOS for OpenSSL to load.
-
 import std/[options, parseopt, strformat, strutils]
 import chronos
 import cdp/[chrome, transport, jsonhooks]

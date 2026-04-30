@@ -56,15 +56,6 @@ that import it for now because Nim doc trips over Chronos' `asyncproc` process
 symbols on this toolchain. The modules still compile normally and are covered
 by `nimble examples`.
 
-**NixOS OpenSSL Runtime Errors**
-On this NixOS host, Nim binaries that load OpenSSL may fail at runtime unless `LD_LIBRARY_PATH` includes nix-ld's library directory:
-
-```sh
-export LD_LIBRARY_PATH=/run/current-system/sw/share/nix-ld/lib
-```
-
-This mainly affects binaries compiled with `-d:ssl`.
-
 **Chrome `webSocketDebuggerUrl` Missing The Port**
 Chrome builds `webSocketDebuggerUrl` from the HTTP request's `Host:` header. Some HTTP clients normalize `Host:` in a way that drops the port. `cdp/chrome.discover` and `cdp/chrome.launch` rewrite the websocket authority back to the host and port they actually contacted, so prefer those helpers over using `/json/version` manually.
 

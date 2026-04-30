@@ -11,9 +11,6 @@
 ##   nim c -d:ssl -r examples/raw/ex_05_aria_snapshot.nim -- --discover --depth=3 --boxes
 ##   nim c -d:ssl -r examples/raw/ex_05_aria_snapshot.nim -- --interactive
 ##
-## Set ``LD_LIBRARY_PATH=/run/current-system/sw/share/nix-ld/lib`` on
-## NixOS if OpenSSL does not load.
-
 import std/[base64, json, options, os, parseopt, strformat, strutils]
 import chronos
 import cdp/[chrome, transport, jsonhooks]

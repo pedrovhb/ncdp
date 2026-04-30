@@ -28,9 +28,6 @@ index; it points at:
 * `project_chrome_host_header.md` — Chrome's `webSocketDebuggerUrl`
   rewriting based on the `Host:` request header. Don't trust the
   returned URL verbatim.
-* `project_nix_ld_library_path.md` — Nim binaries on this NixOS host
-  need `LD_LIBRARY_PATH=/run/current-system/sw/share/nix-ld/lib` at
-  runtime when they pull in OpenSSL.
 
 If you discover a new gotcha, add it as a new `.md` under that
 directory and link it from `MEMORY.md`. Every memory file has frontmatter
@@ -64,11 +61,8 @@ directory and link it from `MEMORY.md`. Every memory file has frontmatter
   it because Nim doc trips over Chronos `asyncproc` on this toolchain.
 * `nimble examples` — compile the numbered examples without running Chrome.
 * `nim c -d:ssl -r examples/ex_01_browser_get_version.nim` —
-  end-to-end smoke against a launched Chrome. Needs
-  `LD_LIBRARY_PATH=/run/current-system/sw/share/nix-ld/lib` at runtime
-  (see memory note).
-* `nws_client` is a local checkout at `/app/nws_client/`, wired via a
-  `path` switch in `config.nims`. It is **not** in the nimble registry.
+  end-to-end smoke against a launched Chrome.
+* `nws_client` is consumed via the GitHub URL dependency in `ncdp.nimble`.
 
 ## Code review
 
