@@ -102,7 +102,7 @@ The top-level numbered examples are the recommended, latest-and-greatest path:
 
 - `examples/ex_01_browser_get_version.nim`: launch/discover Chrome and call `Browser.getVersion` through the high-level browser facade.
 - `examples/ex_02_page_goto_eval_screenshot.nim`: open a page, navigate, evaluate JavaScript, and capture a screenshot through the Page facade.
-- `examples/ex_03_aria_snapshot.nim`: print an AI-friendly ARIA tree; snapshots are Readability-reduced by default, and `--full-page` restores the full-page tree. `--interactive` starts a stdin REPL that can `click`, `fill`, `set`, `select`, `press`, `goto`, and `snapshot` using ARIA refs.
+- `examples/ex_03_aria_snapshot.nim`: print an AI-friendly Markdown view by default; ARIA snapshots remain available with the `aria`/`snapshot` command, and `--full-page` restores full-page source content. `--interactive` starts a stdin REPL that can `click`, `fill`, `set`, `select`, `press`, `goto`, and inspect refs.
 
 Raw generated-CDP examples live under `examples/raw/` and keep their numbering:
 
@@ -121,28 +121,39 @@ nim c -d:ssl -r examples/ex_03_aria_snapshot.nim -- --url=https://example.com --
 nim c -d:ssl -r examples/ex_03_aria_snapshot.nim -- --url=https://example.com --interactive
 ```
 
-Snapshots run the page through Mozilla Readability first so article pages omit
-common navigation, sidebar, footer, and ad boilerplate. Use `--full-page` for
-browser automation workflows that need controls outside the detected article,
-or for pages where Readability falls back too aggressively.
+The default view is Markdown converted from Mozilla Readability's reduced HTML,
+with ARIA as the fallback if Markdown conversion returns no content. Forms and
+common controls are preserved in reduced views as explicit field descriptions
+where possible. Use `--full-page` for browser automation workflows that need
+controls outside the detected article, or for pages where Readability falls
+back too aggressively.
+
+The high-level ARIA module can also convert the same readable HTML view to
+Markdown via a bundled rehype/remark pipeline:
+
+```nim
+echo await page.readableMarkdown()
+```
 
 Interactive commands:
 
 ```text
-snapshot | s              print the current ARIA tree
+view | v                  print the default Markdown view
+aria | snapshot | s       print the current ARIA tree
 click <ref>               click an element, e.g. click ne6
 fill <ref> <text>         replace text in an input/textarea
 set <ref> <value>         set number/date/time/range/color inputs
 select <ref> <value>      select an option by value or label
 press <key>               send real CDP keyboard input, e.g. Tab or F5
-goto <url>                navigate and print a fresh snapshot
-back | b                  go back and print a fresh snapshot
-reload | r                reload and print a fresh snapshot
+goto <url>                navigate and print a fresh Markdown view
+back | b                  go back and print a fresh Markdown view
+reload | r                reload and print a fresh Markdown view
 screenshot | ss <path>    capture a PNG screenshot
 wait <ms>                 sleep for a number of milliseconds
 waitFor <text>            wait until body text contains text
 refs | actions            list refs and supported actions
 links                     list links detected on the page
+markdown | md             print Readability/full-page HTML as Markdown
 console | logs | c        print console messages and page errors
 clearconsole | cc         clear the console message buffer
 eval <javascript>         evaluate JavaScript and print its string result

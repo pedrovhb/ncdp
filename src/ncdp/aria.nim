@@ -7,6 +7,7 @@ import ./browser
 
 const AriaHelperSource = staticRead("../../examples/ariaSnapshot.js")
 const ReadabilitySource = staticRead("../../resources/readability/Readability.js")
+const MarkdownSource = staticRead("../../resources/readability/markdown.js")
 
 type
   AriaSnapshotRoot* {.pure.} = enum
@@ -170,16 +171,42 @@ proc selectByJson(choices: openArray[AriaSelectBy]): JsonNode =
     result.add selectByJson(choice)
 
 proc ariaSnapshotHelperSource(): string =
+  ## Return the bundled Playwright helper without its ESM export footer.
   result = AriaHelperSource
   let exportAt = result.rfind("\nexport {")
   if exportAt >= 0:
     result.setLen(exportAt)
 
 proc readabilitySource(): string =
+  ## Return Mozilla Readability adapted for ncdp's in-page helper.
+  ##
+  ## The upstream CommonJS footer would mutate pages that define
+  ## ``window.module``. The form/control cleanup replacements preserve controls
+  ## in reduced views so agents can still inspect and act on forms.
   result = ReadabilitySource
   let exportAt = result.rfind("\nif (typeof module === \"object\")")
   if exportAt >= 0:
     result.setLen(exportAt)
+  for replacement in [
+    ("this._cleanConditionally(articleContent, \"form\");",
+     "/* ncdp: preserve forms in reduced views */"),
+    ("this._cleanConditionally(articleContent, \"fieldset\");",
+     "/* ncdp: preserve fieldsets in reduced views */"),
+    ("this._clean(articleContent, \"input\");",
+     "/* ncdp: preserve inputs in reduced views */"),
+    ("this._clean(articleContent, \"textarea\");",
+     "/* ncdp: preserve textareas in reduced views */"),
+    ("this._clean(articleContent, \"select\");",
+     "/* ncdp: preserve selects in reduced views */"),
+    ("this._clean(articleContent, \"button\");",
+     "/* ncdp: preserve buttons in reduced views */"),
+  ]:
+    result = result.replace(replacement[0], replacement[1])
+
+proc markdownSource(): string =
+  ## Wrap the generated rehype/remark bundle so its top-level declarations cannot
+  ## collide with the inspected page or with the ARIA helper closure.
+  result = "(() => {\n" & MarkdownSource & "\n})();"
 
 proc ariaRootName(root: AriaSnapshotRoot): string =
   case root
@@ -201,12 +228,14 @@ proc ariaOptionsLiteral(opts: AriaOptions): string =
 proc installAriaHelperExpression(): string =
   let helper = ariaSnapshotHelperSource()
   let readability = readabilitySource()
+  let markdown = markdownSource()
   """
 (() => {
-  if (window.__ncdpAria?.version === 2 && window.__ncdpAria?.elementPoint &&
+  if (window.__ncdpAria?.version === 3 && window.__ncdpAria?.elementPoint &&
       window.__ncdpAria?.focusForFill)
     return "ok";
 """ & readability & """
+""" & markdown & """
 """ & helper & """
   const root = () => document.body || document.documentElement;
   const originAttr = "data-ncdp-readability-origin";
@@ -222,6 +251,9 @@ proc installAriaHelperExpression(): string =
     "menuitemcheckbox", "menuitemradio", "option", "tab", "treeitem",
   ]);
   const defaultOptions = () => ({ mode: "ai", refPrefix: "n", root: "readability" });
+  // Readability runs on a cloned document because it mutates aggressively. Tag
+  // each clone node with its live-page origin so refs and Markdown form state can
+  // later be mapped back to the browser DOM the user can actually interact with.
   const markCloneOrigins = (originalNode, clonedNode, originMap, nextId) => {
     if (originalNode?.nodeType === Node.ELEMENT_NODE &&
         clonedNode?.nodeType === Node.ELEMENT_NODE) {
@@ -250,6 +282,9 @@ proc installAriaHelperExpression(): string =
     return true;
   };
   const pruneInvisibleCloneOrigins = (clonedDoc, originMap) => {
+    // Detached clones do not have reliable computed style/layout. Prune by the
+    // live origin element before Readability scores the clone, otherwise hidden
+    // article content can leak into the reduced view.
     const nodes = [...clonedDoc.querySelectorAll(`[${originAttr}]`)];
     for (const node of nodes) {
       const original = originMap.get(node.getAttribute(originAttr));
@@ -258,6 +293,9 @@ proc installAriaHelperExpression(): string =
     }
   };
   const hydrateImportedRefs = (rootElement, originMap) => {
+    // Readability output is imported into a temporary live container. Reuse refs
+    // already assigned to live elements so reduced snapshot refs remain stable
+    // across observe/action/observe loops.
     for (const node of rootElement.querySelectorAll(`[${originAttr}]`)) {
       const original = originMap.get(node.getAttribute(originAttr));
       if (original?._ariaRef)
@@ -276,6 +314,9 @@ proc installAriaHelperExpression(): string =
       if (!article?.content)
         return null;
       const container = document.createElement("div");
+      // The ARIA helper needs a live DOM subtree for computed style and layout.
+      // Keep the temporary article out of normal stacking order and remove it in
+      // the caller's finally block.
       container.style.position = "absolute";
       container.style.left = "0";
       container.style.top = "0";
@@ -306,6 +347,9 @@ proc installAriaHelperExpression(): string =
     const original = originId ? originMap.get(originId) : null;
     if (original) {
       setAriaNodeElement(ariaNode, original);
+      // Ref actions use real CDP input against the live page. If the original is
+      // hidden or pointer-blocked, drop the cloned ref instead of exposing a ref
+      // that cannot be acted on safely.
       if (ariaNode.ref && (!computeBox(original).visible || !liveReceivesPointerEvents(original)))
         delete ariaNode.ref;
       if (ariaNode.ref)
@@ -333,6 +377,8 @@ proc installAriaHelperExpression(): string =
     snapshot.refs = refs;
   };
   const originalScopeElements = (rootElement, originMap) => {
+    // links() should report visible links from the reduced article even when a
+    // specific link is not interactable enough to receive an ARIA ref.
     const result = new Set();
     if (!originMap)
       return result;
@@ -346,6 +392,80 @@ proc installAriaHelperExpression(): string =
     for (const node of rootElement.querySelectorAll?.(`[${originAttr}]`) || [])
       addOriginal(node);
     return result;
+  };
+  const syncControlState = (target, source) => {
+    // HTML serialization reads attributes/text, while browser form state lives
+    // on properties. Copy current live properties onto a markdown-only clone so
+    // fill/select/set actions are reflected in the next Markdown observation.
+    if (!target || !source)
+      return;
+    if (target instanceof HTMLInputElement && source instanceof HTMLInputElement) {
+      target.setAttribute("value", source.value || "");
+      if (["checkbox", "radio"].includes(source.type)) {
+        if (source.checked) target.setAttribute("checked", "");
+        else target.removeAttribute("checked");
+      }
+    } else if (target instanceof HTMLTextAreaElement && source instanceof HTMLTextAreaElement) {
+      target.textContent = source.value || "";
+    } else if (target instanceof HTMLSelectElement && source instanceof HTMLSelectElement) {
+      const targetOptions = [...target.options];
+      const sourceOptions = [...source.options];
+      for (let i = 0; i < targetOptions.length && i < sourceOptions.length; i++) {
+        if (sourceOptions[i].selected) targetOptions[i].setAttribute("selected", "");
+        else targetOptions[i].removeAttribute("selected");
+      }
+    } else if (target instanceof HTMLButtonElement && source instanceof HTMLButtonElement) {
+      target.setAttribute("value", source.value || "");
+    }
+  };
+  const controlElements = rootElement => {
+    const result = [];
+    if (rootElement.matches?.("input,textarea,select,button"))
+      result.push(rootElement);
+    result.push(...rootElement.querySelectorAll?.("input,textarea,select,button") || []);
+    return result;
+  };
+  const refAnnotatableElements = rootElement => {
+    const selector = "a[href],input,textarea,select,button";
+    const result = [];
+    if (rootElement.matches?.(selector))
+      result.push(rootElement);
+    result.push(...rootElement.querySelectorAll?.(selector) || []);
+    return result;
+  };
+  const annotateMarkdownRefs = (clone, source) => {
+    const clonedElements = refAnnotatableElements(clone);
+    if (source.originMap) {
+      for (const element of clonedElements) {
+        const originId = element.getAttribute?.(originAttr);
+        const ref = originId ? source.originMap.get(originId)?._ariaRef?.ref : "";
+        if (ref) element.setAttribute("data-ncdp-ref", ref);
+      }
+      return;
+    }
+    const sourceElements = refAnnotatableElements(source.root);
+    for (let i = 0; i < clonedElements.length && i < sourceElements.length; i++) {
+      const ref = sourceElements[i]?._ariaRef?.ref;
+      if (ref) clonedElements[i].setAttribute("data-ncdp-ref", ref);
+    }
+  };
+  const markdownHtml = source => {
+    // Never serialize the temporary/live subtree directly: clone first, then
+    // normalize control state on the clone for the rehype/remark converter.
+    const clone = source.root.cloneNode(true);
+    annotateMarkdownRefs(clone, source);
+    if (source.originMap) {
+      for (const control of controlElements(clone)) {
+        const originId = control.getAttribute?.(originAttr);
+        syncControlState(control, originId ? source.originMap.get(originId) : null);
+      }
+    } else {
+      const clonedControls = controlElements(clone);
+      const sourceControls = controlElements(source.root);
+      for (let i = 0; i < clonedControls.length && i < sourceControls.length; i++)
+        syncControlState(clonedControls[i], sourceControls[i]);
+    }
+    return clone.innerHTML || clone.textContent || "";
   };
   const refresh = options => {
     window.__ncdpAriaLastOptions = options || defaultOptions();
@@ -612,9 +732,19 @@ proc installAriaHelperExpression(): string =
     return { sample };
   };
   window.__ncdpAria = {
-    version: 2,
+    version: 3,
     snapshotText(options) {
       return renderAriaTree(refresh(options), window.__ncdpAriaLastOptions).text;
+    },
+    markdown(options) {
+      const resolvedOptions = options || window.__ncdpAriaLastOptions || defaultOptions();
+      refresh(resolvedOptions);
+      const source = snapshotSource(resolvedOptions);
+      try {
+        return globalThis.__ncdpHtmlToMarkdown(markdownHtml(source));
+      } finally {
+        source.cleanup?.();
+      }
     },
     actionRefs(options) {
       refresh(options || window.__ncdpAriaLastOptions || defaultOptions());
@@ -887,6 +1017,16 @@ proc ariaSnapshot*(p: Page; depth = 0; boxes = false): Future[string] {.
     async: (raises: [CatchableError]).} =
   ## Return an ARIA snapshot using the default ``n`` ref prefix.
   result = await p.ariaSnapshot(initAriaOptions(depth = depth, boxes = boxes))
+
+proc readableMarkdown*(p: Page; opts = initAriaOptions()): Future[string] {.
+    async: (raises: [CatchableError]).} =
+  ## Return Markdown converted from the current Readability-reduced HTML view.
+  ##
+  ## Pass ``initAriaOptions(root = AriaSnapshotRoot.FullPage)`` to convert the
+  ## full page body instead of the default reduced article view.
+  await p.ensureAriaHelper()
+  result = await p.evalString("(() => window.__ncdpAria.markdown(" &
+                              ariaOptionsLiteral(opts) & "))()")
 
 proc actionRefs*(p: Page; opts = initAriaOptions()): Future[seq[AriaActionRef]] {.
     async: (raises: [CatchableError]).} =

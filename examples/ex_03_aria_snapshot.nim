@@ -1,7 +1,7 @@
 ## ex_03_aria_snapshot — high-level ARIA observe/action loop.
 ##
-## Prints a Playwright-style ARIA tree and optionally starts a tiny REPL that
-## acts on snapshot refs.
+## Prints a Readability-reduced Markdown view and optionally starts a tiny REPL
+## that can inspect or act on ARIA refs.
 ##
 ## Usage::
 ##
@@ -134,8 +134,13 @@ proc displayUrl(url: string): string =
   else:
     result = url[0 ..< MaxUrl] & "..."
 
-proc printSnapshot(page: Page; args: Args) {.
-    async: (raises: [CatchableError]).} =
+proc ariaOptions(args: Args): AriaOptions =
+  ## Keep every observe/action helper on the same source mode so ``--full-page``
+  ## affects Markdown, ARIA refs, and link enumeration consistently.
+  result = initAriaOptions(depth = args.depth, boxes = args.boxes,
+                           root = args.root)
+
+proc printPageHeader(page: Page) {.async: (raises: [CatchableError]).} =
   let info = await page.evalJson("""
 (() => ({ url: location.href, title: document.title }))()
 """)
@@ -146,26 +151,45 @@ proc printSnapshot(page: Page; args: Args) {.
     let title = if titleNode.isNil or titleNode.kind != JString: "" else: titleNode.getStr()
     echo &"url:   {displayUrl(url)}"
     echo &"title: {title}"
-  echo await page.ariaSnapshot(initAriaOptions(depth = args.depth,
-    boxes = args.boxes, root = args.root))
+
+proc printAriaSnapshot(page: Page; args: Args) {.
+    async: (raises: [CatchableError]).} =
+  await printPageHeader(page)
+  echo await page.ariaSnapshot(args.ariaOptions())
+
+proc printMarkdownView(page: Page; args: Args) {.
+    async: (raises: [CatchableError]).} =
+  ## Print the default observation. Markdown is more compact for page reading;
+  ## ARIA remains the fallback when Markdown extraction produces nothing.
+  await printPageHeader(page)
+  try:
+    let markdown = (await page.readableMarkdown(args.ariaOptions())).strip()
+    if markdown.len > 0:
+      echo markdown
+    else:
+      echo await page.ariaSnapshot(args.ariaOptions())
+  except CatchableError:
+    echo await page.ariaSnapshot(args.ariaOptions())
 
 proc printInteractiveHelp() =
   echo ""
   echo "Interactive commands:"
-  echo "  snapshot | s              print the current ARIA tree"
+  echo "  view | v                  print the default Markdown view"
+  echo "  aria | snapshot | s       print the current ARIA tree"
   echo "  click <ref>               click an element, e.g. click n6"
   echo "  fill <ref> <text>         replace text in an input/textarea"
   echo "  set <ref> <value>         set number/date/time/range/color inputs"
   echo "  select <ref> <value>      select an option by value or label"
   echo "  press <key>               send real CDP keyboard input, e.g. Tab or F5"
-  echo "  goto <url>                navigate and print a fresh snapshot"
-  echo "  back | b                  go back and print a fresh snapshot"
-  echo "  reload | r                reload and print a fresh snapshot"
+  echo "  goto <url>                navigate and print a fresh Markdown view"
+  echo "  back | b                  go back and print a fresh Markdown view"
+  echo "  reload | r                reload and print a fresh Markdown view"
   echo "  screenshot | ss <path>    capture a PNG screenshot"
   echo "  wait <ms>                 sleep for a number of milliseconds"
   echo "  waitFor <text>            wait until body text contains text"
   echo "  refs | actions            list refs and supported actions"
   echo "  links                     list links detected on the page"
+  echo "  markdown | md             print Readability/full-page HTML as Markdown"
   echo "  console | logs | c        print console messages and page errors"
   echo "  clearconsole | cc         clear the console message buffer"
   echo "  eval <javascript>         evaluate JavaScript and print its string result"
@@ -251,9 +275,7 @@ proc actionKinds(item: AriaActionRef): string =
 
 proc printActionRefs(page: Page; args: Args) {.
     async: (raises: [CatchableError]).} =
-  let refs = await page.actionRefs(
-    initAriaOptions(depth = args.depth, boxes = args.boxes,
-                    root = args.root))
+  let refs = await page.actionRefs(args.ariaOptions())
   if refs.len == 0:
     echo "(no actionable refs)"
     return
@@ -269,9 +291,7 @@ proc printActionRefs(page: Page; args: Args) {.
 
 proc printLinks(page: Page; args: Args) {.
     async: (raises: [CatchableError]).} =
-  let links = await page.links(
-    initAriaOptions(depth = args.depth, boxes = args.boxes,
-                    root = args.root))
+  let links = await page.links(args.ariaOptions())
   if links.len == 0:
     echo "(no links)"
     return
@@ -311,12 +331,14 @@ proc interactiveLoop(page: Page; args: Args) {.
       continue
     try:
       let lower = line.toLowerAscii()
-      if lower in ["snapshot", "s"]:
-        await printSnapshot(page, args)
+      if lower in ["view", "v", "markdown", "md"]:
+        await printMarkdownView(page, args)
+      elif lower in ["aria", "snapshot", "s"]:
+        await printAriaSnapshot(page, args)
       elif lower.startsWith("click "):
         echo await page.clickRef(argAfter(line, "click"))
         await sleepAsync(300.milliseconds)
-        await printSnapshot(page, args)
+        await printMarkdownView(page, args)
       elif lower.startsWith("fill "):
         let rest = argAfter(line, "fill")
         let splitAt = rest.find(' ')
@@ -324,7 +346,7 @@ proc interactiveLoop(page: Page; args: Args) {.
           echo "usage: fill <ref> <text>"
         else:
           echo await page.fillRef(rest[0 ..< splitAt], rest[splitAt + 1 .. ^1])
-          await printSnapshot(page, args)
+          await printMarkdownView(page, args)
       elif lower.startsWith("set "):
         let rest = argAfter(line, "set")
         let splitAt = rest.find(' ')
@@ -332,7 +354,7 @@ proc interactiveLoop(page: Page; args: Args) {.
           echo "usage: set <ref> <value>"
         else:
           echo await page.setRef(rest[0 ..< splitAt], rest[splitAt + 1 .. ^1])
-          await printSnapshot(page, args)
+          await printMarkdownView(page, args)
       elif lower.startsWith("select "):
         let rest = argAfter(line, "select")
         let splitAt = rest.find(' ')
@@ -341,22 +363,22 @@ proc interactiveLoop(page: Page; args: Args) {.
         else:
           let values = await page.selectRef(rest[0 ..< splitAt], rest[splitAt + 1 .. ^1])
           echo "selected: ", values.join(", ")
-          await printSnapshot(page, args)
+          await printMarkdownView(page, args)
       elif lower.startsWith("press "):
         echo await page.press(argAfter(line, "press"))
         await sleepAsync(300.milliseconds)
-        await printSnapshot(page, args)
+        await printMarkdownView(page, args)
       elif lower.startsWith("goto "):
         await page.goto(argAfter(line, "goto"))
-        await printSnapshot(page, args)
+        await printMarkdownView(page, args)
       elif lower in ["back", "b"]:
         if await page.goBack():
-          await printSnapshot(page, args)
+          await printMarkdownView(page, args)
         else:
           echo "no previous history entry"
       elif lower in ["reload", "r"]:
         await page.reload()
-        await printSnapshot(page, args)
+        await printMarkdownView(page, args)
       elif lower.startsWith("screenshot "):
         let path = pathArg(line, "screenshot")
         await page.screenshot(path)
@@ -368,11 +390,11 @@ proc interactiveLoop(page: Page; args: Args) {.
       elif lower.startsWith("wait "):
         let ms = parseInt(argAfter(line, "wait"))
         await sleepAsync(ms.milliseconds)
-        await printSnapshot(page, args)
+        await printMarkdownView(page, args)
       elif lower.startsWith("waitfor "):
         let text = line["waitFor".len .. ^1].strip()
         await waitForText(page, text)
-        await printSnapshot(page, args)
+        await printMarkdownView(page, args)
       elif lower in ["refs", "actions"]:
         await printActionRefs(page, args)
       elif lower == "links":
@@ -396,7 +418,7 @@ proc main() {.async: (raises: [CatchableError]).} =
     let page = await br.newPage()
     try:
       await page.goto(args.url)
-      await printSnapshot(page, args)
+      await printMarkdownView(page, args)
       if args.interactive:
         await interactiveLoop(page, args)
     finally:

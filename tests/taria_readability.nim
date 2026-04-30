@@ -46,6 +46,17 @@ const ReadabilityHtml = """
     <p><span class="css-hidden">Hidden Article Text</span></p>
     <p><a href="#article-link" onclick="window.articleClicked = true">Article Link</a></p>
     <p><a class="no-click" href="#dead-link">Dead Link</a></p>
+    <form aria-label="Article Signup">
+      <label>Email <input name="email" type="email" value="ada@example.com"></label>
+      <label><input type="checkbox" name="updates" checked> Send updates</label>
+      <label>Plan
+        <select name="plan">
+          <option value="basic">Basic</option>
+          <option value="pro" selected>Pro</option>
+        </select>
+      </label>
+      <button type="submit">Subscribe</button>
+    </form>
   </article>
   <aside>Sidebar Promo should only appear in the full-page snapshot.</aside>
   <footer>Footer Boilerplate</footer>
@@ -63,14 +74,16 @@ proc newTestBrowser(): Future[Browser] {.async: (raises: [CatchableError]).} =
   opts.extraArgs = @["--no-sandbox"]
   result = await launchBrowser(opts)
 
-proc articleLinkRef(page: Page): Future[string] {.
+proc actionRefByLabel(page: Page; label: string): Future[string] {.
     async: (raises: [CatchableError]).} =
   for row in await page.actionRefs():
-    if row.label == "Article Link":
+    if row.label == label:
       return row.refId
-  raise newException(NcdpError, "Article Link ref not found")
+  raise newException(NcdpError, label & " ref not found")
 
-proc runReadabilitySnapshots(): Future[tuple[reduced, full, clicked: string;
+proc runReadabilitySnapshots(): Future[tuple[reduced, full, markdown,
+                                            fullMarkdown, updatedMarkdown,
+                                            clicked: string;
                                             deadAction, deadLinkListed: bool]] {.
     async: (raises: [CatchableError]).} =
   let browser = await newTestBrowser()
@@ -80,13 +93,19 @@ proc runReadabilitySnapshots(): Future[tuple[reduced, full, clicked: string;
     result.reduced = await page.ariaSnapshot()
     result.full = await page.ariaSnapshot(
       initAriaOptions(root = AriaSnapshotRoot.FullPage))
-    let refId = await page.articleLinkRef()
+    result.markdown = await page.readableMarkdown()
+    result.fullMarkdown = await page.readableMarkdown(
+      initAriaOptions(root = AriaSnapshotRoot.FullPage))
+    let refId = await page.actionRefByLabel("Article Link")
     for row in await page.actionRefs():
       if row.label == "Dead Link":
         result.deadAction = true
     for link in await page.links():
       if link.text == "Dead Link" and link.refId.len == 0:
         result.deadLinkListed = true
+    let emailRef = await page.actionRefByLabel("Email")
+    discard await page.fillRef(emailRef, "grace@example.com")
+    result.updatedMarkdown = await page.readableMarkdown()
     discard await page.clickRef(refId)
     result.clicked = await page.evalString("String(window.articleClicked)")
   finally:
@@ -100,10 +119,26 @@ suite "ARIA Readability integration":
     check "Reader mode should keep this article body" in observed.reduced
     check "Article Link" in observed.reduced
     check "Dead Link" in observed.reduced
+    check "Article Signup" in observed.reduced
     check "Hidden Article Text" notin observed.reduced
     check "Sidebar Promo" notin observed.reduced
     check "Navigation Noise" in observed.full
     check "Sidebar Promo" in observed.full
+    check "Reader mode should keep this article body" in observed.markdown
+    check "[Article Link (ref=" in observed.markdown
+    check "](#article-link)" in observed.markdown
+    check "`[input ref=\"" in observed.markdown
+    check "type=\"email\" name=\"email\" value=\"ada@example.com\"]`" in observed.markdown
+    check "type=\"checkbox\" name=\"updates\" value=\"on\" checked]`" in observed.markdown
+    check "`[select ref=\"" in observed.markdown
+    check "name=\"plan\" options=\"Basic, Pro (selected)\"]`" in observed.markdown
+    check "`[button ref=\"" in observed.markdown
+    check "type=\"submit\" text=\"Subscribe\"]`" in observed.markdown
+    check "type=\"email\" name=\"email\" value=\"grace@example.com\"]`" in observed.updatedMarkdown
+    check "Hidden Article Text" notin observed.markdown
+    check "Sidebar Promo" notin observed.markdown
+    check "Navigation Noise" in observed.fullMarkdown
+    check "Sidebar Promo" in observed.fullMarkdown
     check not observed.deadAction
     check observed.deadLinkListed
     check observed.clicked == "true"

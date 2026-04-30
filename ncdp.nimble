@@ -14,6 +14,9 @@ requires "https://github.com/pedrovhb/nws_client.git#5b09f266758d6bfbbaaf23e7d61
 task gen, "Regenerate CDP bindings from bundled PDL files":
   exec "nim c -r --hints:off src/gen/cdp/driver.nim"
 
+task bundleMarkdown, "Bundle the browser-side Readability HTML-to-Markdown helper":
+  exec "deno bundle --platform browser --no-check --output resources/readability/markdown.js resources/readability/markdown.ts"
+
 task docs, "Generate local API docs into htmldocs/":
   exec "nim doc --project --index:on --outdir:htmldocs src/ncdp.nim"
   exec "nim doc --index:on --outdir:htmldocs src/cdp/transport.nim"
