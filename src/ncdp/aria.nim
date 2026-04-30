@@ -403,6 +403,56 @@ proc installAriaHelperExpression(): string =
       refs.set(element, ref);
     return refs;
   };
+  const waitForScroll = () => new Promise(resolve => {
+    const raf = window.requestAnimationFrame || (fn => setTimeout(fn, 0));
+    raf(() => raf(resolve));
+  });
+  const elementSummary = element => {
+    if (!element)
+      return "none";
+    let result = element.localName || String(element.tagName || "element").toLowerCase();
+    if (element.id)
+      result += `#${element.id}`;
+    const className = typeof element.className === "string"
+      ? element.className
+      : element.getAttribute?.("class") || "";
+    const classes = normalizedText(className).replace(/\s+/g, ".");
+    if (classes)
+      result += `.${classes}`;
+    const text = normalizedText(element.innerText || element.textContent || "").slice(0, 80);
+    if (text)
+      result += ` "${text}"`;
+    return result;
+  };
+  const hitReaches = (element, hit) => !!hit && (hit === element || element.contains(hit));
+  const inViewport = (x, y) => x >= 0 && y >= 0 && x < innerWidth && y < innerHeight;
+  const candidatePoints = rect => {
+    const padX = Math.min(8, rect.width / 2);
+    const padY = Math.min(8, rect.height / 2);
+    return [
+      [rect.left + rect.width / 2, rect.top + rect.height / 2],
+      [rect.left + padX, rect.top + padY],
+      [rect.right - padX, rect.top + padY],
+      [rect.left + padX, rect.bottom - padY],
+      [rect.right - padX, rect.bottom - padY],
+    ];
+  };
+  const reachablePoint = element => {
+    let sample = null;
+    const rects = [...element.getClientRects()].filter(rect => rect.width > 0 && rect.height > 0);
+    for (const rect of rects) {
+      for (const [x, y] of candidatePoints(rect)) {
+        if (!inViewport(x, y))
+          continue;
+        const hit = document.elementFromPoint(x, y);
+        if (!sample)
+          sample = { x, y, hit };
+        if (hitReaches(element, hit))
+          return { x, y };
+      }
+    }
+    return { sample };
+  };
   window.__ncdpAria = {
     snapshotText(options) {
       return renderAriaTree(refresh(options), window.__ncdpAriaLastOptions).text;
@@ -453,18 +503,27 @@ proc installAriaHelperExpression(): string =
       }
       return rows;
     },
-    elementPoint(ref) {
+    async elementPoint(ref) {
       const element = elementForRef(ref);
       if (!element)
         throw new Error(`No element for ref=${ref}. Run snapshot and use a visible ref.`);
-      element.scrollIntoView({ block: "center", inline: "center" });
+      element.scrollIntoView({ block: "center", inline: "center", behavior: "instant" });
+      await waitForScroll();
+      const point = reachablePoint(element);
+      if (point.x !== undefined)
+        return point;
       const rect = element.getBoundingClientRect();
       if (!rect.width || !rect.height)
         throw new Error(`ref=${ref} has no clickable box`);
-      return {
+      const sample = point.sample || {
         x: rect.left + rect.width / 2,
         y: rect.top + rect.height / 2,
+        hit: document.elementFromPoint(rect.left + rect.width / 2, rect.top + rect.height / 2),
       };
+      throw new Error(
+        `ref=${ref} click intercepted; top element at ` +
+        `(${sample.x.toFixed(1)}, ${sample.y.toFixed(1)}) is ` +
+        `${elementSummary(sample.hit)}; target is ${elementSummary(element)}`);
     },
     focusForFill(ref) {
       const element = elementForRef(ref);

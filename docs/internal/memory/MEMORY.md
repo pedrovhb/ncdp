@@ -1,3 +1,4 @@
 - [Chrome Host header CDP gotcha](project_chrome_host_header.md) — Chrome echoes the request `Host:` header into `webSocketDebuggerUrl`, dropping the port; rewrite the authority client-side.
+- [ARIA click hit-testing](project_aria_click_hit_testing.md) — ARIA refs can remain visible/actionable while overlays intercept real CDP mouse input; validate click points with `elementFromPoint`.
 - [Higher-level tools over generated CDP](project_higher_level_tools.md) — direction for Browser/Page/ARIA APIs layered above the raw generated CDP modules.
 - [Project layout](project_layout.md) — ncdp source tree, paths, key references.
