@@ -9,7 +9,7 @@ srcDir        = "src"
 requires "nim >= 2.2.8"
 requires "chronos >= 4.2.2"
 requires "chronicles >= 0.12.2"
-requires "https://github.com/pedrovhb/nws_client.git#5b09f266758d6bfbbaaf23e7d61dc753117fb223"
+requires "https://github.com/pedrovhb/nws_client.git == 0.1.0"
 
 task gen, "Regenerate CDP bindings from bundled PDL files":
   exec "nim c -r --hints:off src/gen/cdp/driver.nim"
